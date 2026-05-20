@@ -21,8 +21,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "evaluate_in_memory"
-path = "fuzz_targets/evaluate_in_memory.rs"
+name = "eval_queries"
+path = "fuzz_targets/eval_queries.rs"
 test = false
 doc = false
 bench = false

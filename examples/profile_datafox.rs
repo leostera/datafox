@@ -34,18 +34,22 @@ fn main() -> Result<()> {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(200);
     let mode = std::env::var("DATAFOX_PROFILE_MODE").unwrap_or_else(|_| "serial".to_string());
+    let evaluator = match mode.as_str() {
+        "parallel" => Evaluator::builder()
+            .with_store(&storage)
+            .parallel()
+            .build()?,
+        "serial" => Evaluator::builder().with_store(&storage).build()?,
+        other => {
+            eprintln!("unknown DATAFOX_PROFILE_MODE={other:?}; use serial or parallel");
+            std::process::exit(2);
+        }
+    };
 
     let start = Instant::now();
     let mut total = 0usize;
     for _ in 0..iterations {
-        total += match mode.as_str() {
-            "parallel" => Evaluator::evaluate_in_memory_parallel(&storage, &query)?.len(),
-            "serial" => Evaluator::evaluate_in_memory(&storage, &query)?.len(),
-            other => {
-                eprintln!("unknown DATAFOX_PROFILE_MODE={other:?}; use serial or parallel");
-                std::process::exit(2);
-            }
-        };
+        total += evaluator.eval(&query)?.count();
     }
 
     let elapsed = start.elapsed();

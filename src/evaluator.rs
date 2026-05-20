@@ -1,6 +1,8 @@
-use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::vec::IntoIter;
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -12,12 +14,151 @@ use crate::{
 pub type SubstitutionStream = mpsc::Receiver<Result<Substitution>>;
 
 const DEFAULT_STREAM_BUFFER: usize = 64;
-const PARALLEL_SEED_THRESHOLD: usize = 1024;
+const DEFAULT_PARALLEL_SEED_THRESHOLD: usize = 1024;
 
-/// Query-only evaluator over a snapshot universe.
-pub struct Evaluator;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvaluationStrategy {
+    Serial,
+    Parallel { seed_threshold: usize },
+}
 
-impl Evaluator {
+/// Iterator over substitutions produced by an evaluator run.
+pub struct Evaluation {
+    substitutions: IntoIter<Substitution>,
+}
+
+impl Evaluation {
+    fn new(substitutions: Vec<Substitution>) -> Self {
+        Self {
+            substitutions: substitutions.into_iter(),
+        }
+    }
+}
+
+impl Iterator for Evaluation {
+    type Item = Substitution;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.substitutions.next()
+    }
+}
+
+/// Query evaluator bound to a fact store and runtime strategy.
+#[derive(Clone)]
+pub struct Evaluator<'store> {
+    storage: &'store InMemoryStorage,
+    strategy: EvaluationStrategy,
+    pool: Option<Arc<ThreadPool>>,
+}
+
+/// Builder for configuring an [`Evaluator`].
+pub struct EvaluatorBuilder<'store> {
+    storage: Option<&'store InMemoryStorage>,
+    strategy: EvaluationStrategy,
+    threads: Option<usize>,
+}
+
+impl<'store> EvaluatorBuilder<'store> {
+    pub fn with_store(mut self, storage: &'store InMemoryStorage) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    pub fn serial(mut self) -> Self {
+        self.strategy = EvaluationStrategy::Serial;
+        self
+    }
+
+    pub fn parallel(mut self) -> Self {
+        self.strategy = EvaluationStrategy::Parallel {
+            seed_threshold: DEFAULT_PARALLEL_SEED_THRESHOLD,
+        };
+        self
+    }
+
+    pub fn seed_threshold(mut self, seed_threshold: usize) -> Self {
+        if matches!(self.strategy, EvaluationStrategy::Serial) {
+            self = self.parallel();
+        }
+        self.strategy = EvaluationStrategy::Parallel { seed_threshold };
+        self
+    }
+
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.threads = Some(threads);
+        self
+    }
+
+    pub fn build(self) -> Result<Evaluator<'store>> {
+        let storage = self.storage.ok_or_else(|| Error::EvaluatorBuild {
+            message: "missing storage; call `with_store` before `build`".to_string(),
+        })?;
+
+        match self.strategy {
+            EvaluationStrategy::Serial => Ok(Evaluator {
+                storage,
+                strategy: self.strategy,
+                pool: None,
+            }),
+            EvaluationStrategy::Parallel { .. } => {
+                let mut builder = ThreadPoolBuilder::new();
+                if let Some(threads) = self.threads {
+                    builder = builder.num_threads(threads);
+                }
+                let pool = builder.build().map_err(|error| Error::EvaluatorBuild {
+                    message: error.to_string(),
+                })?;
+                Ok(Evaluator {
+                    storage,
+                    strategy: self.strategy,
+                    pool: Some(Arc::new(pool)),
+                })
+            }
+        }
+    }
+}
+
+impl Default for EvaluatorBuilder<'_> {
+    fn default() -> Self {
+        Self {
+            storage: None,
+            strategy: EvaluationStrategy::Serial,
+            threads: None,
+        }
+    }
+}
+
+impl<'store> Evaluator<'store> {
+    pub fn builder() -> EvaluatorBuilder<'store> {
+        EvaluatorBuilder::default()
+    }
+
+    pub fn eval(&self, query: &Query) -> Result<Evaluation> {
+        let substitutions = match self.strategy {
+            EvaluationStrategy::Serial => {
+                let mut regex_cache = HashMap::new();
+                Self::evaluate_clauses_serial(self.storage, query.clauses(), &mut regex_cache)?
+            }
+            EvaluationStrategy::Parallel { seed_threshold } => {
+                let Some(pool) = &self.pool else {
+                    return Err(Error::EvaluatorBuild {
+                        message: "parallel strategy was configured without a worker pool"
+                            .to_string(),
+                    });
+                };
+                pool.install(|| {
+                    Self::evaluate_clauses_parallel(self.storage, query.clauses(), seed_threshold)
+                })?
+            }
+        };
+
+        Ok(Evaluation::new(substitutions))
+    }
+
+    pub fn strategy(&self) -> EvaluationStrategy {
+        self.strategy
+    }
+
     pub async fn query<S>(universe: &Universe<S>, atom: &Atom) -> Result<SubstitutionStream>
     where
         S: Storage + Clone + Send + Sync + 'static,
@@ -30,21 +171,6 @@ impl Evaluator {
         S: Storage + Clone + Send + Sync + 'static,
     {
         Self::evaluate_query(universe.clone(), query.clone()).await
-    }
-
-    pub fn evaluate_in_memory(
-        storage: &InMemoryStorage,
-        query: &Query,
-    ) -> Result<Vec<Substitution>> {
-        let mut regex_cache = HashMap::new();
-        Self::evaluate_clauses_in_memory(storage, query.clauses(), &mut regex_cache)
-    }
-
-    pub fn evaluate_in_memory_parallel(
-        storage: &InMemoryStorage,
-        query: &Query,
-    ) -> Result<Vec<Substitution>> {
-        Self::evaluate_clauses_in_memory_parallel(storage, query.clauses())
     }
 
     async fn evaluate_query<S>(universe: Universe<S>, query: Query) -> Result<SubstitutionStream>
@@ -148,7 +274,7 @@ impl Evaluator {
         Ok(seeds)
     }
 
-    fn evaluate_clauses_in_memory(
+    fn evaluate_clauses_serial(
         storage: &InMemoryStorage,
         clauses: Vec<Clause>,
         regex_cache: &mut HashMap<String, Regex>,
@@ -199,14 +325,15 @@ impl Evaluator {
         Ok(seeds)
     }
 
-    fn evaluate_clauses_in_memory_parallel(
+    fn evaluate_clauses_parallel(
         storage: &InMemoryStorage,
         clauses: Vec<Clause>,
+        seed_threshold: usize,
     ) -> Result<Vec<Substitution>> {
         let mut seeds = vec![Substitution::new()];
 
         for clause in clauses {
-            if seeds.len() < PARALLEL_SEED_THRESHOLD {
+            if seeds.len() < seed_threshold {
                 let mut regex_cache = HashMap::new();
                 seeds = Self::advance_clause_in_memory(storage, clause, seeds, &mut regex_cache)?;
                 continue;
@@ -836,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_in_memory_matches_sequential_for_atoms_negation_and_builtins() -> Result<()> {
+    fn parallel_evaluator_matches_serial_for_atoms_negation_and_builtins() -> Result<()> {
         let persons = (0..3_000)
             .map(|id| vec![Value::integer(id), Value::string(format!("node-{id}"))])
             .collect::<Vec<_>>();
@@ -850,8 +977,17 @@ mod tests {
         ]);
         let query = parse_query(r#"person(Id, Name), !banned(Id), contains(Name, "1")"#)?;
 
-        let sequential = Evaluator::evaluate_in_memory(&storage, &query)?;
-        let parallel = Evaluator::evaluate_in_memory_parallel(&storage, &query)?;
+        let sequential = Evaluator::builder()
+            .with_store(&storage)
+            .build()?
+            .eval(&query)?
+            .collect::<Vec<_>>();
+        let parallel = Evaluator::builder()
+            .with_store(&storage)
+            .parallel()
+            .build()?
+            .eval(&query)?
+            .collect::<Vec<_>>();
 
         assert!(!parallel.is_empty());
         assert_eq!(
@@ -906,8 +1042,9 @@ mod tests {
                     ),
                 ]);
 
+                let evaluator = Evaluator::builder().with_store(&storage).build().expect("evaluator");
                 for query in queries.into_iter().take(16) {
-                    let _ = Evaluator::evaluate_in_memory(&storage, &query);
+                    let _ = evaluator.eval(&query);
                 }
             }
         }

@@ -22,7 +22,8 @@ fn main() -> datafox::Result<()> {
     )]);
 
     let query = parse_query("edge(From, 2)")?;
-    let results = Evaluator::evaluate_in_memory(&storage, &query)?;
+    let evaluator = Evaluator::builder().with_store(&storage).build()?;
+    let results = evaluator.eval(&query)?.collect::<Vec<_>>();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].lookup("From"), Some(&Value::integer(1)));
@@ -56,4 +57,17 @@ Builtins are available as clauses:
 
 Negated atoms and builtin arguments must be grounded by earlier clauses. Evaluation is read-only and snapshot-oriented; facts are supplied by the caller.
 
-For CPU-heavy in-memory workloads, `Evaluator::evaluate_in_memory_parallel` evaluates each clause frontier across a Rayon worker pool once the intermediate seed set is large enough to amortize scheduling overhead.
+Configure the evaluator runtime profile up front:
+
+```rust
+let evaluator = Evaluator::builder()
+    .with_store(&storage)
+    .parallel()
+    .threads(4)
+    .seed_threshold(1024)
+    .build()?;
+
+for substitution in evaluator.eval(&query)? {
+    println!("{substitution}");
+}
+```

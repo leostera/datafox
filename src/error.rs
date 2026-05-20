@@ -36,6 +36,8 @@ pub enum Error {
     },
     #[error("query parse failed")]
     Parse { diagnostics: Vec<Diagnostic> },
+    #[error("failed to build evaluator: {message}")]
+    EvaluatorBuild { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

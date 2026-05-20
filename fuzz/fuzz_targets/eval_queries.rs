@@ -40,7 +40,10 @@ fuzz_target!(|data: &[u8]| {
         ),
     ]);
 
+    let Ok(evaluator) = Evaluator::builder().with_store(&storage).build() else {
+        return;
+    };
     for query in queries.into_iter().take(16) {
-        let _ = Evaluator::evaluate_in_memory(&storage, &query);
+        let _ = evaluator.eval(&query);
     }
 });

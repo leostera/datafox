@@ -3,7 +3,7 @@
 //!
 //! The crate is intentionally small: callers provide facts through [`Storage`],
 //! parse read-only queries with [`parse_query`] or [`parse_queries`], and evaluate
-//! them with [`Evaluator`].
+//! them with an [`Evaluator`] configured for the runtime profile you need.
 //!
 //! ```
 //! use datafox::{Evaluator, InMemoryStorage, Value, parse_query};
@@ -16,7 +16,8 @@
 //!     ],
 //! )]);
 //! let query = parse_query("edge(From, 2)")?;
-//! let results = Evaluator::evaluate_in_memory(&storage, &query)?;
+//! let evaluator = Evaluator::builder().with_store(&storage).build()?;
+//! let results = evaluator.eval(&query)?.collect::<Vec<_>>();
 //!
 //! assert_eq!(results.len(), 1);
 //! assert_eq!(results[0].lookup("From"), Some(&Value::integer(1)));
@@ -48,7 +49,9 @@ mod value;
 pub use ast::{Atom, Clause, Query};
 pub use diagnostic::{Diagnostic, Span};
 pub use error::{Error, Result};
-pub use evaluator::{Evaluator, SubstitutionStream};
+pub use evaluator::{
+    Evaluation, EvaluationStrategy, Evaluator, EvaluatorBuilder, SubstitutionStream,
+};
 pub use parser::{parse_queries, parse_query};
 pub use storage::{FactTuple, InMemoryStorage, Storage, TupleStream, matches_pattern};
 pub use substitution::Substitution;
