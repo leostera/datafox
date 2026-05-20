@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use regex::Regex;
 
@@ -151,6 +151,8 @@ impl Default for Prelude {
 }
 
 fn default_relations() -> Vec<BinaryRelation> {
+    let regex_cache = Arc::new(Mutex::new(HashMap::new()));
+
     vec![
         BinaryRelation::new("=", |left, right| left == right),
         BinaryRelation::new("eq", |left, right| left == right),
@@ -202,16 +204,22 @@ fn default_relations() -> Vec<BinaryRelation> {
         BinaryRelation::new("notContains", |left, right| {
             string_args(left, right).is_some_and(|(haystack, needle)| !haystack.contains(needle))
         }),
-        BinaryRelation::new("matchesRegex", |left, right| {
-            string_args(left, right).is_some_and(|(haystack, pattern)| {
-                Regex::new(pattern).is_ok_and(|regex| regex.is_match(haystack))
+        {
+            let regex_cache = Arc::clone(&regex_cache);
+            BinaryRelation::new("matchesRegex", move |left, right| {
+                string_args(left, right).is_some_and(|(haystack, pattern)| {
+                    regex_is_match(&regex_cache, haystack, pattern)
+                })
             })
-        }),
-        BinaryRelation::new("notMatchesRegex", |left, right| {
-            string_args(left, right).is_some_and(|(haystack, pattern)| {
-                Regex::new(pattern).is_ok_and(|regex| !regex.is_match(haystack))
+        },
+        {
+            let regex_cache = Arc::clone(&regex_cache);
+            BinaryRelation::new("notMatchesRegex", move |left, right| {
+                string_args(left, right).is_some_and(|(haystack, pattern)| {
+                    !regex_is_match(&regex_cache, haystack, pattern)
+                })
             })
-        }),
+        },
     ]
 }
 
@@ -255,4 +263,20 @@ fn string_args<'a>(left: &'a Value, right: &'a Value) -> Option<(&'a str, &'a st
         (Value::String(left), Value::String(right)) => Some((left, right)),
         _ => None,
     }
+}
+
+fn regex_is_match(
+    cache: &Mutex<HashMap<String, Option<Regex>>>,
+    haystack: &str,
+    pattern: &str,
+) -> bool {
+    let regex = match cache.lock() {
+        Ok(mut cache) => cache
+            .entry(pattern.to_string())
+            .or_insert_with(|| Regex::new(pattern).ok())
+            .clone(),
+        Err(_) => Regex::new(pattern).ok(),
+    };
+
+    regex.is_some_and(|regex| regex.is_match(haystack))
 }
