@@ -1,0 +1,78 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - fuzz/**
+      - src/**
+      - .github/workflows/fuzz.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - fuzz/**
+      - src/**
+      - .github/workflows/fuzz.yml
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - parse_queries
+          - eval_queries
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-fuzz
+            ~/.cargo/git
+            ~/.cargo/registry
+            fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('Cargo.toml', 'fuzz/Cargo.toml', 'fuzz/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-fuzz-
+
+      - name: Install cargo-fuzz
+        run: |
+          if ! command -v cargo-fuzz >/dev/null 2>&1; then
+            cargo install cargo-fuzz --locked
+          fi
+
+      - name: Run fuzz target
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=300
+          else
+            cargo +nightly fuzz run ${{ matrix.target }} -- -runs=10000
+          fi
+
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
