@@ -171,7 +171,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
                 let mut value = String::new();
                 let mut closed = false;
 
-                while let Some((index, next)) = chars.next() {
+                for (index, next) in chars.by_ref() {
                     end = index + next.len_utf8();
                     if next == '"' {
                         closed = true;
@@ -199,7 +199,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
                 let mut value = String::new();
                 let mut closed = false;
 
-                while let Some((index, next)) = chars.next() {
+                for (index, next) in chars.by_ref() {
                     end = index + next.len_utf8();
                     if next == '\'' {
                         closed = true;

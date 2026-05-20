@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::slice;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -19,6 +20,36 @@ pub trait Storage {
         predicate: &str,
         pattern: Vec<Option<Value>>,
     ) -> Result<TupleStream>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FactEstimate {
+    pub rows: usize,
+    pub exact: bool,
+}
+
+impl FactEstimate {
+    pub fn exact(rows: usize) -> Self {
+        Self { rows, exact: true }
+    }
+
+    pub fn upper_bound(rows: usize) -> Self {
+        Self { rows, exact: false }
+    }
+}
+
+pub trait FactStore {
+    type Scan<'store, 'pattern>: Iterator<Item = &'store FactTuple>
+    where
+        Self: 'store;
+
+    fn scan<'store, 'pattern>(
+        &'store self,
+        predicate: &str,
+        pattern: &'pattern [Option<Value>],
+    ) -> Self::Scan<'store, 'pattern>;
+
+    fn estimate(&self, predicate: &str, pattern: &[Option<Value>]) -> FactEstimate;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -63,36 +94,106 @@ impl InMemoryStorage {
         predicate: &str,
         pattern: &[Option<Value>],
     ) -> Vec<&'a FactTuple> {
+        self.scan(predicate, pattern).collect()
+    }
+}
+
+pub enum FactScan<'store, 'pattern> {
+    Empty,
+    All {
+        iter: slice::Iter<'store, FactTuple>,
+        pattern: &'pattern [Option<Value>],
+    },
+    Indexed {
+        facts: &'store [FactTuple],
+        tuple_indexes: slice::Iter<'store, usize>,
+        pattern: &'pattern [Option<Value>],
+    },
+}
+
+impl<'store> Iterator for FactScan<'store, '_> {
+    type Item = &'store FactTuple;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::All { iter, pattern } => {
+                iter.find(|tuple| matches_pattern(pattern, tuple.as_slice()))
+            }
+            Self::Indexed {
+                facts,
+                tuple_indexes,
+                pattern,
+            } => tuple_indexes.find_map(|tuple_index| {
+                facts
+                    .get(*tuple_index)
+                    .filter(|tuple| matches_pattern(pattern, tuple))
+            }),
+        }
+    }
+}
+
+impl FactStore for InMemoryStorage {
+    type Scan<'store, 'pattern>
+        = FactScan<'store, 'pattern>
+    where
+        Self: 'store;
+
+    fn scan<'store, 'pattern>(
+        &'store self,
+        predicate: &str,
+        pattern: &'pattern [Option<Value>],
+    ) -> Self::Scan<'store, 'pattern> {
         let Some(facts) = self.facts.get(predicate) else {
-            return Vec::new();
+            return FactScan::Empty;
         };
 
-        let best_index = pattern
-            .iter()
-            .enumerate()
-            .filter_map(|(value_index, value)| {
-                let value = value.as_ref()?;
-                let tuple_indexes = self
-                    .indexes
-                    .get(predicate)?
-                    .get(&(value_index, value.clone()))?;
-                Some(tuple_indexes)
-            })
-            .min_by_key(|tuple_indexes| tuple_indexes.len());
+        let best_index = best_index(self, predicate, pattern);
 
         if let Some(tuple_indexes) = best_index {
-            return tuple_indexes
-                .iter()
-                .filter_map(|tuple_index| facts.get(*tuple_index))
-                .filter(|tuple| matches_pattern(pattern, tuple))
-                .collect();
+            return FactScan::Indexed {
+                facts,
+                tuple_indexes: tuple_indexes.iter(),
+                pattern,
+            };
         }
 
-        facts
-            .iter()
-            .filter(|tuple| matches_pattern(pattern, tuple))
-            .collect()
+        FactScan::All {
+            iter: facts.iter(),
+            pattern,
+        }
     }
+
+    fn estimate(&self, predicate: &str, pattern: &[Option<Value>]) -> FactEstimate {
+        let Some(facts) = self.facts.get(predicate) else {
+            return FactEstimate::exact(0);
+        };
+
+        if let Some(tuple_indexes) = best_index(self, predicate, pattern) {
+            return FactEstimate::upper_bound(tuple_indexes.len());
+        }
+
+        FactEstimate::upper_bound(facts.len())
+    }
+}
+
+fn best_index<'a>(
+    storage: &'a InMemoryStorage,
+    predicate: &str,
+    pattern: &[Option<Value>],
+) -> Option<&'a Vec<usize>> {
+    pattern
+        .iter()
+        .enumerate()
+        .filter_map(|(value_index, value)| {
+            let value = value.as_ref()?;
+            let tuple_indexes = storage
+                .indexes
+                .get(predicate)?
+                .get(&(value_index, value.clone()))?;
+            Some(tuple_indexes)
+        })
+        .min_by_key(|tuple_indexes| tuple_indexes.len())
 }
 
 #[async_trait]
@@ -138,7 +239,7 @@ pub fn matches_pattern(pattern: &[Option<Value>], tuple: &[Value]) -> bool {
 mod tests {
     use tokio::runtime::Runtime;
 
-    use crate::{InMemoryStorage, Storage, Value, matches_pattern};
+    use crate::{FactStore, InMemoryStorage, Storage, Value, matches_pattern};
 
     #[test]
     fn matches_pattern_treats_none_as_wildcard() {
@@ -176,5 +277,22 @@ mod tests {
         });
 
         assert_eq!(tuples, vec![vec![Value::integer(1), Value::integer(2)]]);
+    }
+
+    #[test]
+    fn in_memory_storage_scans_without_collecting_first() {
+        let storage = InMemoryStorage::from_facts([(
+            "edge".to_string(),
+            vec![
+                vec![Value::integer(1), Value::integer(2)],
+                vec![Value::integer(2), Value::integer(3)],
+            ],
+        )]);
+
+        let pattern = vec![Some(Value::integer(2)), None];
+        let tuples = storage.scan("edge", &pattern).collect::<Vec<_>>();
+
+        assert_eq!(tuples, vec![&vec![Value::integer(2), Value::integer(3)]]);
+        assert_eq!(storage.estimate("edge", &pattern).rows, 1);
     }
 }

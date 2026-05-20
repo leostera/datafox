@@ -3,10 +3,10 @@
 //!
 //! The crate is intentionally small: callers provide facts through [`Storage`],
 //! parse read-only queries with [`parse_query`] or [`parse_queries`], and evaluate
-//! them with an [`Evaluator`] configured for the runtime profile you need.
+//! them with a [`DatafoxClient`] configured for the runtime profile you need.
 //!
 //! ```
-//! use datafox::{Evaluator, InMemoryStorage, Value, parse_query};
+//! use datafox::{DatafoxClient, DatafoxConfig, InMemoryStorage, Value, parse_query};
 //!
 //! let storage = InMemoryStorage::from_facts([(
 //!     "edge".to_string(),
@@ -16,8 +16,8 @@
 //!     ],
 //! )]);
 //! let query = parse_query("edge(From, 2)")?;
-//! let evaluator = Evaluator::builder().with_store(&storage).build()?;
-//! let results = evaluator.eval(&query)?.collect::<Vec<_>>();
+//! let datafox = DatafoxClient::new(DatafoxConfig::new(&storage))?;
+//! let results = datafox.eval(&query)?.collect::<Vec<_>>();
 //!
 //! assert_eq!(results.len(), 1);
 //! assert_eq!(results[0].lookup("From"), Some(&Value::integer(1)));
@@ -30,17 +30,20 @@
 //! - [`Atom`], [`Clause`], and [`Query`] for query syntax trees.
 //! - [`Diagnostic`] and [`parse_query`] for query parsing with context.
 //! - [`Substitution`] and [`Unifier`] for binding and matching query variables.
-//! - [`Storage`], [`Universe`], and [`Evaluator`] for snapshot-based query execution.
+//! - [`DatafoxClient`], [`DatafoxConfig`], [`Planner`], [`Plan`], and [`Storage`]
+//!   for snapshot-based query execution.
 //! - [`Prelude`], [`BinaryRelation`], and [`BinaryOperator`] for ambient facts,
 //!   builtin relations, and expression operators.
 //! - [`Error`] and [`Result`] for typed failures.
 //! - [`atom!`], [`var!`], [`lit!`], and [`subst!`] for test and call-site ergonomics.
 
 mod ast;
+mod client;
 mod diagnostic;
 pub mod error;
 mod evaluator;
 mod parser;
+mod plan;
 mod prelude;
 mod storage;
 mod substitution;
@@ -50,14 +53,17 @@ mod universe;
 mod value;
 
 pub use ast::{Atom, Clause, Query};
+pub use client::{DatafoxClient, DatafoxConfig};
 pub use diagnostic::{Diagnostic, Span};
 pub use error::{Error, Result};
-pub use evaluator::{
-    Evaluation, EvaluationStrategy, Evaluator, EvaluatorBuilder, SubstitutionStream,
-};
+pub use evaluator::{Evaluation, EvaluationStrategy};
 pub use parser::{parse_queries, parse_query};
-pub use prelude::{BinaryOperator, BinaryRelation, Prelude};
-pub use storage::{FactTuple, InMemoryStorage, Storage, TupleStream, matches_pattern};
+pub use plan::{Plan, Planner};
+pub use prelude::{BinaryOperator, BinaryRelation, OperatorOutcome, Prelude, RelationOutcome};
+pub use storage::{
+    FactEstimate, FactScan, FactStore, FactTuple, InMemoryStorage, Storage, TupleStream,
+    matches_pattern,
+};
 pub use substitution::Substitution;
 pub use term::Term;
 pub use unify::Unifier;

@@ -5,8 +5,40 @@ use regex::Regex;
 
 use crate::{FactTuple, InMemoryStorage, Value};
 
-type BinaryRelationFn = dyn Fn(&Value, &Value) -> bool + Send + Sync;
-type BinaryOperatorFn = dyn Fn(&Value, &Value) -> Option<Value> + Send + Sync;
+type BinaryRelationFn = dyn Fn(&Value, &Value) -> RelationOutcome + Send + Sync;
+type BinaryOperatorFn = dyn Fn(&Value, &Value) -> OperatorOutcome + Send + Sync;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationOutcome {
+    Match,
+    NoMatch,
+}
+
+impl RelationOutcome {
+    pub fn from_bool(matches: bool) -> Self {
+        if matches { Self::Match } else { Self::NoMatch }
+    }
+
+    pub fn is_match(self) -> bool {
+        matches!(self, Self::Match)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorOutcome {
+    Value(Value),
+    NoResult,
+}
+
+impl OperatorOutcome {
+    pub fn value(value: impl Into<Value>) -> Self {
+        Self::Value(value.into())
+    }
+
+    pub fn no_result() -> Self {
+        Self::NoResult
+    }
+}
 
 #[derive(Clone)]
 pub struct BinaryRelation {
@@ -17,7 +49,7 @@ pub struct BinaryRelation {
 impl BinaryRelation {
     pub fn new(
         name: impl Into<String>,
-        relation: impl Fn(&Value, &Value) -> bool + Send + Sync + 'static,
+        relation: impl Fn(&Value, &Value) -> RelationOutcome + Send + Sync + 'static,
     ) -> Self {
         Self {
             name: name.into(),
@@ -25,11 +57,20 @@ impl BinaryRelation {
         }
     }
 
+    pub fn from_bool(
+        name: impl Into<String>,
+        relation: impl Fn(&Value, &Value) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self::new(name, move |left, right| {
+            RelationOutcome::from_bool(relation(left, right))
+        })
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub fn evaluate(&self, left: &Value, right: &Value) -> bool {
+    pub fn evaluate(&self, left: &Value, right: &Value) -> RelationOutcome {
         (self.relation)(left, right)
     }
 }
@@ -43,7 +84,7 @@ pub struct BinaryOperator {
 impl BinaryOperator {
     pub fn new(
         name: impl Into<String>,
-        operator: impl Fn(&Value, &Value) -> Option<Value> + Send + Sync + 'static,
+        operator: impl Fn(&Value, &Value) -> OperatorOutcome + Send + Sync + 'static,
     ) -> Self {
         Self {
             name: name.into(),
@@ -51,11 +92,22 @@ impl BinaryOperator {
         }
     }
 
+    pub fn from_option(
+        name: impl Into<String>,
+        operator: impl Fn(&Value, &Value) -> Option<Value> + Send + Sync + 'static,
+    ) -> Self {
+        Self::new(name, move |left, right| {
+            operator(left, right)
+                .map(OperatorOutcome::Value)
+                .unwrap_or(OperatorOutcome::NoResult)
+        })
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub fn evaluate(&self, left: &Value, right: &Value) -> Option<Value> {
+    pub fn evaluate(&self, left: &Value, right: &Value) -> OperatorOutcome {
         (self.operator)(left, right)
     }
 }
@@ -154,59 +206,59 @@ fn default_relations() -> Vec<BinaryRelation> {
     let regex_cache = Arc::new(Mutex::new(HashMap::new()));
 
     vec![
-        BinaryRelation::new("=", |left, right| left == right),
-        BinaryRelation::new("eq", |left, right| left == right),
-        BinaryRelation::new("<", |left, right| {
+        BinaryRelation::from_bool("=", |left, right| left == right),
+        BinaryRelation::from_bool("eq", |left, right| left == right),
+        BinaryRelation::from_bool("<", |left, right| {
             values_are_ordered_compatibly(left, right) && left < right
         }),
-        BinaryRelation::new("lt", |left, right| {
+        BinaryRelation::from_bool("lt", |left, right| {
             values_are_ordered_compatibly(left, right) && left < right
         }),
-        BinaryRelation::new("<=", |left, right| {
+        BinaryRelation::from_bool("<=", |left, right| {
             values_are_ordered_compatibly(left, right) && left <= right
         }),
-        BinaryRelation::new("lte", |left, right| {
+        BinaryRelation::from_bool("lte", |left, right| {
             values_are_ordered_compatibly(left, right) && left <= right
         }),
-        BinaryRelation::new(">", |left, right| {
+        BinaryRelation::from_bool(">", |left, right| {
             values_are_ordered_compatibly(left, right) && left > right
         }),
-        BinaryRelation::new("gt", |left, right| {
+        BinaryRelation::from_bool("gt", |left, right| {
             values_are_ordered_compatibly(left, right) && left > right
         }),
-        BinaryRelation::new(">=", |left, right| {
+        BinaryRelation::from_bool(">=", |left, right| {
             values_are_ordered_compatibly(left, right) && left >= right
         }),
-        BinaryRelation::new("gte", |left, right| {
+        BinaryRelation::from_bool("gte", |left, right| {
             values_are_ordered_compatibly(left, right) && left >= right
         }),
-        BinaryRelation::new("before", |left, right| {
+        BinaryRelation::from_bool("before", |left, right| {
             values_are_ordered_compatibly(left, right) && left < right
         }),
-        BinaryRelation::new("after", |left, right| {
+        BinaryRelation::from_bool("after", |left, right| {
             values_are_ordered_compatibly(left, right) && left > right
         }),
-        BinaryRelation::new("startsWith", |left, right| {
+        BinaryRelation::from_bool("startsWith", |left, right| {
             string_args(left, right).is_some_and(|(haystack, needle)| haystack.starts_with(needle))
         }),
-        BinaryRelation::new("endsWith", |left, right| {
+        BinaryRelation::from_bool("endsWith", |left, right| {
             string_args(left, right).is_some_and(|(haystack, needle)| haystack.ends_with(needle))
         }),
-        BinaryRelation::new("contains", |left, right| {
+        BinaryRelation::from_bool("contains", |left, right| {
             string_args(left, right).is_some_and(|(haystack, needle)| haystack.contains(needle))
         }),
-        BinaryRelation::new("notStartsWith", |left, right| {
+        BinaryRelation::from_bool("notStartsWith", |left, right| {
             string_args(left, right).is_some_and(|(haystack, needle)| !haystack.starts_with(needle))
         }),
-        BinaryRelation::new("notEndsWith", |left, right| {
+        BinaryRelation::from_bool("notEndsWith", |left, right| {
             string_args(left, right).is_some_and(|(haystack, needle)| !haystack.ends_with(needle))
         }),
-        BinaryRelation::new("notContains", |left, right| {
+        BinaryRelation::from_bool("notContains", |left, right| {
             string_args(left, right).is_some_and(|(haystack, needle)| !haystack.contains(needle))
         }),
         {
             let regex_cache = Arc::clone(&regex_cache);
-            BinaryRelation::new("matchesRegex", move |left, right| {
+            BinaryRelation::from_bool("matchesRegex", move |left, right| {
                 string_args(left, right).is_some_and(|(haystack, pattern)| {
                     regex_is_match(&regex_cache, haystack, pattern)
                 })
@@ -214,7 +266,7 @@ fn default_relations() -> Vec<BinaryRelation> {
         },
         {
             let regex_cache = Arc::clone(&regex_cache);
-            BinaryRelation::new("notMatchesRegex", move |left, right| {
+            BinaryRelation::from_bool("notMatchesRegex", move |left, right| {
                 string_args(left, right).is_some_and(|(haystack, pattern)| {
                     !regex_is_match(&regex_cache, haystack, pattern)
                 })
@@ -226,20 +278,40 @@ fn default_relations() -> Vec<BinaryRelation> {
 fn default_operators() -> Vec<BinaryOperator> {
     vec![
         BinaryOperator::new("+", |left, right| {
-            let (left, right) = integer_args(left, right)?;
-            left.checked_add(right).map(Value::integer)
+            let Some((left, right)) = integer_args(left, right) else {
+                return OperatorOutcome::NoResult;
+            };
+            left.checked_add(right)
+                .map(Value::integer)
+                .map(OperatorOutcome::Value)
+                .unwrap_or(OperatorOutcome::NoResult)
         }),
         BinaryOperator::new("-", |left, right| {
-            let (left, right) = integer_args(left, right)?;
-            left.checked_sub(right).map(Value::integer)
+            let Some((left, right)) = integer_args(left, right) else {
+                return OperatorOutcome::NoResult;
+            };
+            left.checked_sub(right)
+                .map(Value::integer)
+                .map(OperatorOutcome::Value)
+                .unwrap_or(OperatorOutcome::NoResult)
         }),
         BinaryOperator::new("*", |left, right| {
-            let (left, right) = integer_args(left, right)?;
-            left.checked_mul(right).map(Value::integer)
+            let Some((left, right)) = integer_args(left, right) else {
+                return OperatorOutcome::NoResult;
+            };
+            left.checked_mul(right)
+                .map(Value::integer)
+                .map(OperatorOutcome::Value)
+                .unwrap_or(OperatorOutcome::NoResult)
         }),
         BinaryOperator::new("/", |left, right| {
-            let (left, right) = integer_args(left, right)?;
-            left.checked_div(right).map(Value::integer)
+            let Some((left, right)) = integer_args(left, right) else {
+                return OperatorOutcome::NoResult;
+            };
+            left.checked_div(right)
+                .map(Value::integer)
+                .map(OperatorOutcome::Value)
+                .unwrap_or(OperatorOutcome::NoResult)
         }),
     ]
 }

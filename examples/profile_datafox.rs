@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use datafox::{Evaluator, InMemoryStorage, Result, Value, parse_query};
+use datafox::{DatafoxClient, DatafoxConfig, InMemoryStorage, Result, Value, parse_query};
 
 fn main() -> Result<()> {
     let nodes = std::env::var("DATAFOX_PROFILE_NODES")
@@ -34,22 +34,20 @@ fn main() -> Result<()> {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(200);
     let mode = std::env::var("DATAFOX_PROFILE_MODE").unwrap_or_else(|_| "serial".to_string());
-    let evaluator = match mode.as_str() {
-        "parallel" => Evaluator::builder()
-            .with_store(&storage)
-            .parallel()
-            .build()?,
-        "serial" => Evaluator::builder().with_store(&storage).build()?,
+    let datafox = match mode.as_str() {
+        "parallel" => DatafoxClient::new(DatafoxConfig::new(&storage).parallel())?,
+        "serial" => DatafoxClient::new(DatafoxConfig::new(&storage))?,
         other => {
             eprintln!("unknown DATAFOX_PROFILE_MODE={other:?}; use serial or parallel");
             std::process::exit(2);
         }
     };
+    let plan = datafox.plan(&query)?;
 
     let start = Instant::now();
     let mut total = 0usize;
     for _ in 0..iterations {
-        total += evaluator.eval(&query)?.count();
+        total += datafox.eval_plan(&plan)?.count();
     }
 
     let elapsed = start.elapsed();

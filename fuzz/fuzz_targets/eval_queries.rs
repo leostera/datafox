@@ -1,6 +1,6 @@
 #![no_main]
 
-use datafox::{Evaluator, InMemoryStorage, Value};
+use datafox::{DatafoxClient, DatafoxConfig, InMemoryStorage, Value};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -40,10 +40,19 @@ fuzz_target!(|data: &[u8]| {
         ),
     ]);
 
-    let Ok(evaluator) = Evaluator::builder().with_store(&storage).build() else {
+    let Ok(datafox) = DatafoxClient::new(DatafoxConfig::new(&storage)) else {
+        return;
+    };
+    let Ok(parallel_datafox) =
+        DatafoxClient::new(DatafoxConfig::new(&storage).parallel().seed_threshold(1))
+    else {
         return;
     };
     for query in queries.into_iter().take(16) {
-        let _ = evaluator.eval(&query);
+        let Ok(plan) = datafox.plan(&query) else {
+            continue;
+        };
+        let _ = datafox.eval_plan(&plan);
+        let _ = parallel_datafox.eval_plan(&plan);
     }
 });

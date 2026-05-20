@@ -1,16 +1,22 @@
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use std::sync::Arc;
 use std::vec::IntoIter;
+#[cfg(test)]
 use tokio::sync::mpsc;
+#[cfg(test)]
 use tracing::debug;
 
+use crate::plan::{PlannedAtom, PlannedClause, PlannedRelation, PlannedTerm, VariableId};
 use crate::{
-    Atom, Clause, Error, InMemoryStorage, Prelude, Query, Result, Storage, Substitution, Term,
-    Universe, Value,
+    Error, FactStore, InMemoryStorage, OperatorOutcome, Plan, Prelude, Result, Substitution, Value,
 };
 
+#[cfg(test)]
+use crate::{Atom, Clause, Query, Storage, Term, Universe};
+#[cfg(test)]
 pub type SubstitutionStream = mpsc::Receiver<Result<Substitution>>;
 
+#[cfg(test)]
 const DEFAULT_STREAM_BUFFER: usize = 64;
 const DEFAULT_PARALLEL_SEED_THRESHOLD: usize = 1024;
 
@@ -18,6 +24,14 @@ const DEFAULT_PARALLEL_SEED_THRESHOLD: usize = 1024;
 pub enum EvaluationStrategy {
     Serial,
     Parallel { seed_threshold: usize },
+}
+
+impl EvaluationStrategy {
+    pub(crate) fn parallel_default() -> Self {
+        Self::Parallel {
+            seed_threshold: DEFAULT_PARALLEL_SEED_THRESHOLD,
+        }
+    }
 }
 
 /// Iterator over substitutions produced by an evaluator run.
@@ -33,6 +47,48 @@ impl Evaluation {
     }
 }
 
+#[derive(Clone)]
+struct PlanSeed {
+    bindings: Vec<Option<Value>>,
+}
+
+impl PlanSeed {
+    fn new(variable_count: usize) -> Self {
+        Self {
+            bindings: vec![None; variable_count],
+        }
+    }
+
+    fn lookup(&self, variable: VariableId) -> Option<&Value> {
+        self.bindings.get(variable.index())?.as_ref()
+    }
+
+    fn bind(&mut self, variable: VariableId, value: Value) -> bool {
+        let slot = &mut self.bindings[variable.index()];
+        match slot {
+            Some(existing) => existing == &value,
+            None => {
+                *slot = Some(value);
+                true
+            }
+        }
+    }
+
+    fn into_substitution(self, plan: &Plan) -> Substitution {
+        Substitution::from_bindings(self.bindings.into_iter().enumerate().filter_map(
+            |(index, value)| {
+                value.map(|value| {
+                    (
+                        plan.variable_name(VariableId::from_index(index))
+                            .to_string(),
+                        value,
+                    )
+                })
+            },
+        ))
+    }
+}
+
 impl Iterator for Evaluation {
     type Item = Substitution;
 
@@ -43,7 +99,7 @@ impl Iterator for Evaluation {
 
 /// Query evaluator bound to a fact store and runtime strategy.
 #[derive(Clone)]
-pub struct Evaluator<'store> {
+pub(crate) struct Evaluator<'store> {
     storage: &'store InMemoryStorage,
     prelude: Prelude,
     strategy: EvaluationStrategy,
@@ -51,7 +107,7 @@ pub struct Evaluator<'store> {
 }
 
 /// Builder for configuring an [`Evaluator`].
-pub struct EvaluatorBuilder<'store> {
+pub(crate) struct EvaluatorBuilder<'store> {
     storage: Option<&'store InMemoryStorage>,
     prelude: Prelude,
     strategy: EvaluationStrategy,
@@ -59,29 +115,27 @@ pub struct EvaluatorBuilder<'store> {
 }
 
 impl<'store> EvaluatorBuilder<'store> {
-    pub fn with_store(mut self, storage: &'store InMemoryStorage) -> Self {
+    pub(crate) fn with_store(mut self, storage: &'store InMemoryStorage) -> Self {
         self.storage = Some(storage);
         self
     }
 
-    pub fn with_prelude(mut self, prelude: Prelude) -> Self {
+    pub(crate) fn with_prelude(mut self, prelude: Prelude) -> Self {
         self.prelude = prelude;
         self
     }
 
-    pub fn serial(mut self) -> Self {
+    pub(crate) fn serial(mut self) -> Self {
         self.strategy = EvaluationStrategy::Serial;
         self
     }
 
-    pub fn parallel(mut self) -> Self {
-        self.strategy = EvaluationStrategy::Parallel {
-            seed_threshold: DEFAULT_PARALLEL_SEED_THRESHOLD,
-        };
+    pub(crate) fn parallel(mut self) -> Self {
+        self.strategy = EvaluationStrategy::parallel_default();
         self
     }
 
-    pub fn seed_threshold(mut self, seed_threshold: usize) -> Self {
+    pub(crate) fn seed_threshold(mut self, seed_threshold: usize) -> Self {
         if matches!(self.strategy, EvaluationStrategy::Serial) {
             self = self.parallel();
         }
@@ -89,12 +143,12 @@ impl<'store> EvaluatorBuilder<'store> {
         self
     }
 
-    pub fn threads(mut self, threads: usize) -> Self {
+    pub(crate) fn threads(mut self, threads: usize) -> Self {
         self.threads = Some(threads);
         self
     }
 
-    pub fn build(self) -> Result<Evaluator<'store>> {
+    pub(crate) fn build(self) -> Result<Evaluator<'store>> {
         let storage = self.storage.ok_or_else(|| Error::EvaluatorBuild {
             message: "missing storage; call `with_store` before `build`".to_string(),
         })?;
@@ -137,14 +191,33 @@ impl Default for EvaluatorBuilder<'_> {
 }
 
 impl<'store> Evaluator<'store> {
-    pub fn builder() -> EvaluatorBuilder<'store> {
+    pub(crate) fn builder() -> EvaluatorBuilder<'store> {
         EvaluatorBuilder::default()
     }
 
-    pub fn eval(&self, query: &Query) -> Result<Evaluation> {
-        let substitutions = match self.strategy {
+    pub(crate) fn new(
+        storage: &'store InMemoryStorage,
+        prelude: Prelude,
+        strategy: EvaluationStrategy,
+        threads: Option<usize>,
+    ) -> Result<Self> {
+        let mut builder = Self::builder().with_store(storage).with_prelude(prelude);
+        builder = match strategy {
+            EvaluationStrategy::Serial => builder.serial(),
+            EvaluationStrategy::Parallel { seed_threshold } => {
+                builder.parallel().seed_threshold(seed_threshold)
+            }
+        };
+        if let Some(threads) = threads {
+            builder = builder.threads(threads);
+        }
+        builder.build()
+    }
+
+    pub(crate) fn eval_plan(&self, plan: &Plan) -> Result<Evaluation> {
+        let seeds = match self.strategy {
             EvaluationStrategy::Serial => {
-                Self::evaluate_clauses_serial(self.storage, &self.prelude, query.clauses())?
+                Self::evaluate_plan_serial(self.storage, &self.prelude, plan)?
             }
             EvaluationStrategy::Parallel { seed_threshold } => {
                 let Some(pool) = &self.pool else {
@@ -154,37 +227,42 @@ impl<'store> Evaluator<'store> {
                     });
                 };
                 pool.install(|| {
-                    Self::evaluate_clauses_parallel(
-                        self.storage,
-                        &self.prelude,
-                        query.clauses(),
-                        seed_threshold,
-                    )
+                    Self::evaluate_plan_parallel(self.storage, &self.prelude, plan, seed_threshold)
                 })?
             }
         };
 
+        let substitutions = seeds
+            .into_iter()
+            .map(|seed| seed.into_substitution(plan))
+            .collect();
         Ok(Evaluation::new(substitutions))
     }
 
-    pub fn strategy(&self) -> EvaluationStrategy {
+    pub(crate) fn strategy(&self) -> EvaluationStrategy {
         self.strategy
     }
 
-    pub async fn query<S>(universe: &Universe<S>, atom: &Atom) -> Result<SubstitutionStream>
+    #[cfg(test)]
+    pub(crate) async fn query<S>(universe: &Universe<S>, atom: &Atom) -> Result<SubstitutionStream>
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
         Self::evaluate_query(universe.clone(), Query::single(atom.clone())).await
     }
 
-    pub async fn evaluate<S>(universe: &Universe<S>, query: &Query) -> Result<SubstitutionStream>
+    #[cfg(test)]
+    pub(crate) async fn evaluate<S>(
+        universe: &Universe<S>,
+        query: &Query,
+    ) -> Result<SubstitutionStream>
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
         Self::evaluate_query(universe.clone(), query.clone()).await
     }
 
+    #[cfg(test)]
     async fn evaluate_query<S>(universe: Universe<S>, query: Query) -> Result<SubstitutionStream>
     where
         S: Storage + Clone + Send + Sync + 'static,
@@ -220,6 +298,7 @@ impl<'store> Evaluator<'store> {
         Ok(rx)
     }
 
+    #[cfg(test)]
     async fn evaluate_positive_clauses<S>(
         universe: &Universe<S>,
         clauses: Vec<Clause>,
@@ -289,148 +368,136 @@ impl<'store> Evaluator<'store> {
         Ok(seeds)
     }
 
-    fn evaluate_clauses_serial(
+    fn evaluate_plan_serial(
         storage: &InMemoryStorage,
         prelude: &Prelude,
-        clauses: Vec<Clause>,
-    ) -> Result<Vec<Substitution>> {
-        let mut seeds = vec![Substitution::new()];
+        plan: &Plan,
+    ) -> Result<Vec<PlanSeed>> {
+        let mut seeds = vec![PlanSeed::new(plan.variable_count())];
 
-        for clause in clauses {
-            let atom = match clause {
-                Clause::Atom(atom) => atom,
-                Clause::Negated(atom) => {
+        for clause in plan.clauses() {
+            match clause {
+                PlannedClause::Atom(atom) => {
                     let mut next_seeds = Vec::new();
                     for seed in seeds {
-                        for variable in atom.variables() {
-                            if !seed.contains(variable) {
-                                return Err(Error::UngroundedBuiltin {
-                                    name: format!("!{}", atom.predicate),
-                                });
-                            }
-                        }
-
+                        next_seeds.extend(Self::query_planned_atom_matches(
+                            storage, prelude, plan, atom, &seed,
+                        )?);
+                    }
+                    seeds = next_seeds;
+                }
+                PlannedClause::Negated(atom) => {
+                    let mut next_seeds = Vec::new();
+                    for seed in seeds {
                         let matches =
-                            Self::query_atom_matches_in_memory(storage, prelude, &atom, &seed)?;
+                            Self::query_planned_atom_matches(storage, prelude, plan, atom, &seed)?;
                         if matches.is_empty() {
                             next_seeds.push(seed);
                         }
                     }
                     seeds = next_seeds;
-                    continue;
                 }
-                Clause::Builtin { name, args } => {
+                PlannedClause::Relation(relation) => {
                     let mut next_seeds = Vec::new();
                     for seed in seeds {
-                        if Self::evaluate_builtin_clause(&name, &args, &seed, prelude)? {
+                        if evaluate_planned_relation(relation, &seed, plan)? {
                             next_seeds.push(seed);
                         }
                     }
                     seeds = next_seeds;
-                    continue;
                 }
-            };
-
-            let mut next_seeds = Vec::new();
-            for seed in seeds {
-                next_seeds.extend(Self::query_atom_matches_in_memory(
-                    storage, prelude, &atom, &seed,
-                )?);
             }
-            seeds = next_seeds;
         }
 
         Ok(seeds)
     }
 
-    fn evaluate_clauses_parallel(
+    fn evaluate_plan_parallel(
         storage: &InMemoryStorage,
         prelude: &Prelude,
-        clauses: Vec<Clause>,
+        plan: &Plan,
         seed_threshold: usize,
-    ) -> Result<Vec<Substitution>> {
-        let mut seeds = vec![Substitution::new()];
+    ) -> Result<Vec<PlanSeed>> {
+        let mut seeds = vec![PlanSeed::new(plan.variable_count())];
 
-        for clause in clauses {
+        for clause in plan.clauses() {
             if seeds.len() < seed_threshold {
-                seeds = Self::advance_clause_in_memory(storage, prelude, clause, seeds)?;
+                seeds = Self::advance_planned_clause(storage, prelude, plan, clause, seeds)?;
                 continue;
             }
 
-            seeds = Self::advance_clause_in_memory_parallel(storage, prelude, clause, seeds)?;
+            seeds = Self::advance_planned_clause_parallel(storage, prelude, plan, clause, seeds)?;
         }
 
         Ok(seeds)
     }
 
-    fn advance_clause_in_memory(
+    fn advance_planned_clause(
         storage: &InMemoryStorage,
         prelude: &Prelude,
-        clause: Clause,
-        seeds: Vec<Substitution>,
-    ) -> Result<Vec<Substitution>> {
-        let atom = match clause {
-            Clause::Atom(atom) => atom,
-            Clause::Negated(atom) => {
+        plan: &Plan,
+        clause: &PlannedClause,
+        seeds: Vec<PlanSeed>,
+    ) -> Result<Vec<PlanSeed>> {
+        match clause {
+            PlannedClause::Atom(atom) => {
                 let mut next_seeds = Vec::new();
                 for seed in seeds {
-                    ensure_negation_is_grounded(&atom, &seed)?;
-
+                    next_seeds.extend(Self::query_planned_atom_matches(
+                        storage, prelude, plan, atom, &seed,
+                    )?);
+                }
+                Ok(next_seeds)
+            }
+            PlannedClause::Negated(atom) => {
+                let mut next_seeds = Vec::new();
+                for seed in seeds {
                     let matches =
-                        Self::query_atom_matches_in_memory(storage, prelude, &atom, &seed)?;
+                        Self::query_planned_atom_matches(storage, prelude, plan, atom, &seed)?;
                     if matches.is_empty() {
                         next_seeds.push(seed);
                     }
                 }
-                return Ok(next_seeds);
+                Ok(next_seeds)
             }
-            Clause::Builtin { name, args } => {
+            PlannedClause::Relation(relation) => {
                 let mut next_seeds = Vec::new();
                 for seed in seeds {
-                    if Self::evaluate_builtin_clause(&name, &args, &seed, prelude)? {
+                    if evaluate_planned_relation(relation, &seed, plan)? {
                         next_seeds.push(seed);
                     }
                 }
-                return Ok(next_seeds);
+                Ok(next_seeds)
             }
-        };
-
-        let mut next_seeds = Vec::new();
-        for seed in seeds {
-            next_seeds.extend(Self::query_atom_matches_in_memory(
-                storage, prelude, &atom, &seed,
-            )?);
         }
-        Ok(next_seeds)
     }
 
-    fn advance_clause_in_memory_parallel(
+    fn advance_planned_clause_parallel(
         storage: &InMemoryStorage,
         prelude: &Prelude,
-        clause: Clause,
-        seeds: Vec<Substitution>,
-    ) -> Result<Vec<Substitution>> {
+        plan: &Plan,
+        clause: &PlannedClause,
+        seeds: Vec<PlanSeed>,
+    ) -> Result<Vec<PlanSeed>> {
         match clause {
-            Clause::Atom(atom) => seeds
+            PlannedClause::Atom(atom) => seeds
                 .into_par_iter()
-                .map(|seed| Self::query_atom_matches_in_memory(storage, prelude, &atom, &seed))
+                .map(|seed| Self::query_planned_atom_matches(storage, prelude, plan, atom, &seed))
                 .collect::<Result<Vec<_>>>()
                 .map(flatten_chunks),
-            Clause::Negated(atom) => seeds
+            PlannedClause::Negated(atom) => seeds
                 .into_par_iter()
                 .map(|seed| {
-                    ensure_negation_is_grounded(&atom, &seed)?;
-
                     let matches =
-                        Self::query_atom_matches_in_memory(storage, prelude, &atom, &seed)?;
+                        Self::query_planned_atom_matches(storage, prelude, plan, atom, &seed)?;
                     Ok(matches.is_empty().then_some(seed))
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(flatten_options),
-            Clause::Builtin { name, args } => seeds
+            PlannedClause::Relation(relation) => seeds
                 .into_par_iter()
                 .map(|seed| {
-                    Self::evaluate_builtin_clause(&name, &args, &seed, prelude)
+                    evaluate_planned_relation(relation, &seed, plan)
                         .map(|keep| keep.then_some(seed))
                 })
                 .collect::<Result<Vec<_>>>()
@@ -438,6 +505,33 @@ impl<'store> Evaluator<'store> {
         }
     }
 
+    fn query_planned_atom_matches(
+        storage: &InMemoryStorage,
+        prelude: &Prelude,
+        plan: &Plan,
+        atom: &PlannedAtom,
+        seed: &PlanSeed,
+    ) -> Result<Vec<PlanSeed>> {
+        let predicate = plan.predicate_name(atom.predicate);
+        let pattern = planned_atom_to_pattern(atom, seed, plan)?;
+        let mut substitutions = Vec::new();
+
+        for tuple in storage.scan(predicate, &pattern) {
+            if let Some(substitution) = match_planned_atom(seed, atom, tuple, plan)? {
+                substitutions.push(substitution);
+            }
+        }
+
+        for tuple in prelude.facts().scan(predicate, &pattern) {
+            if let Some(substitution) = match_planned_atom(seed, atom, tuple, plan)? {
+                substitutions.push(substitution);
+            }
+        }
+
+        Ok(substitutions)
+    }
+
+    #[cfg(test)]
     fn evaluate_builtin_clause(
         name: &str,
         args: &[Term],
@@ -463,7 +557,7 @@ impl<'store> Evaluator<'store> {
 
         match (left, right) {
             (EvaluatedTerm::Value(left), EvaluatedTerm::Value(right)) => {
-                Ok(relation.evaluate(&left, &right))
+                Ok(relation.evaluate(&left, &right).is_match())
             }
             (EvaluatedTerm::NoResult, _) | (_, EvaluatedTerm::NoResult) => Ok(false),
             (EvaluatedTerm::Ungrounded, _) | (_, EvaluatedTerm::Ungrounded) => {
@@ -474,6 +568,7 @@ impl<'store> Evaluator<'store> {
         }
     }
 
+    #[cfg(test)]
     async fn query_atom_matches<S>(
         universe: &Universe<S>,
         prelude: &Prelude,
@@ -502,30 +597,6 @@ impl<'store> Evaluator<'store> {
         );
         Ok(substitutions)
     }
-
-    fn query_atom_matches_in_memory(
-        storage: &InMemoryStorage,
-        prelude: &Prelude,
-        atom: &Atom,
-        seed: &Substitution,
-    ) -> Result<Vec<Substitution>> {
-        let pattern = atom_to_pattern(atom, seed, prelude)?;
-        let mut substitutions = Vec::new();
-
-        for tuple in storage.facts_matching(&atom.predicate, &pattern) {
-            if let Some(substitution) = match_atom(seed, atom, tuple, prelude)? {
-                substitutions.push(substitution);
-            }
-        }
-
-        for tuple in prelude.facts().facts_matching(&atom.predicate, &pattern) {
-            if let Some(substitution) = match_atom(seed, atom, tuple, prelude)? {
-                substitutions.push(substitution);
-            }
-        }
-
-        Ok(substitutions)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -535,6 +606,131 @@ enum EvaluatedTerm {
     NoResult,
 }
 
+fn planned_atom_to_pattern(
+    atom: &PlannedAtom,
+    seed: &PlanSeed,
+    plan: &Plan,
+) -> Result<Vec<Option<Value>>> {
+    atom.args
+        .iter()
+        .map(|term| match evaluate_planned_term(term, seed, plan)? {
+            EvaluatedTerm::Value(value) => Ok(Some(value)),
+            EvaluatedTerm::Ungrounded | EvaluatedTerm::NoResult => Ok(None),
+        })
+        .collect()
+}
+
+fn match_planned_atom(
+    seed: &PlanSeed,
+    atom: &PlannedAtom,
+    tuple: &[Value],
+    plan: &Plan,
+) -> Result<Option<PlanSeed>> {
+    if atom.args.len() != tuple.len() {
+        return Err(Error::ArityMismatch {
+            predicate: plan.predicate_name(atom.predicate).to_string(),
+            expected: atom.args.len(),
+            found: tuple.len(),
+        });
+    }
+
+    let mut current = seed.clone();
+    for (term, value) in atom.args.iter().zip(tuple) {
+        match term {
+            PlannedTerm::Const(expected) if plan.value(*expected) != value => return Ok(None),
+            PlannedTerm::Const(_) | PlannedTerm::Wildcard => {}
+            PlannedTerm::Var(variable) => {
+                if !current.bind(*variable, value.clone()) {
+                    return Ok(None);
+                }
+            }
+            PlannedTerm::Call { .. } => match evaluate_planned_term(term, &current, plan)? {
+                EvaluatedTerm::Value(expected) if expected != *value => return Ok(None),
+                EvaluatedTerm::Value(_) => {}
+                EvaluatedTerm::Ungrounded | EvaluatedTerm::NoResult => return Ok(None),
+            },
+        }
+    }
+
+    Ok(Some(current))
+}
+
+fn evaluate_planned_relation(
+    relation: &PlannedRelation,
+    seed: &PlanSeed,
+    plan: &Plan,
+) -> Result<bool> {
+    let [left, right] = relation.args.as_slice() else {
+        return Err(Error::BuiltinArityMismatch {
+            name: relation.name.clone(),
+            expected: 2,
+            found: relation.args.len(),
+        });
+    };
+
+    let left = evaluate_planned_term(left, seed, plan)?;
+    let right = evaluate_planned_term(right, seed, plan)?;
+
+    match (left, right) {
+        (EvaluatedTerm::Value(left), EvaluatedTerm::Value(right)) => {
+            Ok(relation.relation.evaluate(&left, &right).is_match())
+        }
+        (EvaluatedTerm::NoResult, _) | (_, EvaluatedTerm::NoResult) => Ok(false),
+        (EvaluatedTerm::Ungrounded, _) | (_, EvaluatedTerm::Ungrounded) => {
+            Err(Error::UngroundedBuiltin {
+                name: relation.name.clone(),
+            })
+        }
+    }
+}
+
+fn evaluate_planned_term(
+    term: &PlannedTerm,
+    seed: &PlanSeed,
+    plan: &Plan,
+) -> Result<EvaluatedTerm> {
+    match term {
+        PlannedTerm::Const(value) => Ok(EvaluatedTerm::Value(plan.value(*value).clone())),
+        PlannedTerm::Var(variable) => Ok(seed
+            .lookup(*variable)
+            .cloned()
+            .map(EvaluatedTerm::Value)
+            .unwrap_or(EvaluatedTerm::Ungrounded)),
+        PlannedTerm::Wildcard => Ok(EvaluatedTerm::Ungrounded),
+        PlannedTerm::Call {
+            name,
+            operator,
+            args,
+        } => {
+            let [left, right] = args.as_slice() else {
+                return Err(Error::BuiltinArityMismatch {
+                    name: name.clone(),
+                    expected: 2,
+                    found: args.len(),
+                });
+            };
+            let left = evaluate_planned_term(left, seed, plan)?;
+            let right = evaluate_planned_term(right, seed, plan)?;
+
+            match (left, right) {
+                (EvaluatedTerm::NoResult, _) | (_, EvaluatedTerm::NoResult) => {
+                    Ok(EvaluatedTerm::NoResult)
+                }
+                (EvaluatedTerm::Ungrounded, _) | (_, EvaluatedTerm::Ungrounded) => {
+                    Ok(EvaluatedTerm::Ungrounded)
+                }
+                (EvaluatedTerm::Value(left), EvaluatedTerm::Value(right)) => {
+                    match operator.evaluate(&left, &right) {
+                        OperatorOutcome::Value(value) => Ok(EvaluatedTerm::Value(value)),
+                        OperatorOutcome::NoResult => Ok(EvaluatedTerm::NoResult),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn atom_to_pattern(
     atom: &Atom,
     seed: &Substitution,
@@ -549,6 +745,7 @@ fn atom_to_pattern(
         .collect()
 }
 
+#[cfg(test)]
 fn match_atom(
     seed: &Substitution,
     atom: &Atom,
@@ -584,6 +781,7 @@ fn match_atom(
     Ok(Some(current))
 }
 
+#[cfg(test)]
 fn evaluate_term(term: &Term, seed: &Substitution, prelude: &Prelude) -> Result<EvaluatedTerm> {
     match term {
         Term::Const(value) => Ok(EvaluatedTerm::Value(value.clone())),
@@ -615,26 +813,14 @@ fn evaluate_term(term: &Term, seed: &Substitution, prelude: &Prelude) -> Result<
                     let Some(operator) = prelude.operator(name) else {
                         return Err(Error::UnsupportedBuiltin { name: name.clone() });
                     };
-                    Ok(operator
-                        .evaluate(&left, &right)
-                        .map(EvaluatedTerm::Value)
-                        .unwrap_or(EvaluatedTerm::NoResult))
+                    match operator.evaluate(&left, &right) {
+                        OperatorOutcome::Value(value) => Ok(EvaluatedTerm::Value(value)),
+                        OperatorOutcome::NoResult => Ok(EvaluatedTerm::NoResult),
+                    }
                 }
             }
         }
     }
-}
-
-fn ensure_negation_is_grounded(atom: &Atom, seed: &Substitution) -> Result<()> {
-    for variable in atom.variables() {
-        if !seed.contains(variable) {
-            return Err(Error::UngroundedBuiltin {
-                name: format!("!{}", atom.predicate),
-            });
-        }
-    }
-
-    Ok(())
 }
 
 fn flatten_chunks<T>(chunks: Vec<Vec<T>>) -> Vec<T> {
@@ -654,13 +840,14 @@ fn flatten_options<T>(values: Vec<Option<T>>) -> Vec<T> {
 mod tests {
     use proptest::prelude::*;
 
+    use super::{Evaluator, SubstitutionStream};
     use crate::{
-        BinaryOperator, Clause, Evaluator, InMemoryStorage, Prelude, Query, Result, Universe,
-        Value, parse_query,
+        BinaryOperator, Clause, DatafoxClient, DatafoxConfig, InMemoryStorage, OperatorOutcome,
+        Prelude, Query, Result, Universe, Value, parse_query,
     };
 
     async fn collect_results(
-        mut stream: crate::SubstitutionStream,
+        mut stream: SubstitutionStream,
     ) -> crate::Result<Vec<crate::Substitution>> {
         let mut results = Vec::new();
         while let Some(result) = stream.recv().await {
@@ -958,14 +1145,83 @@ mod tests {
         )]);
         let query = parse_query("value(X), (X + 1) = 4, (X * 2) > 5, (X - 1) = 2, (X / 1) = 3")?;
 
-        let results = Evaluator::builder()
-            .with_store(&storage)
-            .build()?
+        let results = DatafoxClient::new(DatafoxConfig::new(&storage))?
             .eval(&query)?
             .collect::<Vec<_>>();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].lookup("X"), Some(&Value::integer(3)));
+        Ok(())
+    }
+
+    #[test]
+    fn evaluator_exposes_plan_and_eval_plan() -> Result<()> {
+        let storage = InMemoryStorage::from_facts([(
+            "value".to_string(),
+            vec![vec![Value::integer(1)], vec![Value::integer(2)]],
+        )]);
+        let datafox = DatafoxClient::new(DatafoxConfig::new(&storage))?;
+        let query = parse_query("value(X), X > 1")?;
+        let plan = datafox.plan(&query)?;
+
+        let results = datafox.eval_plan(&plan)?.collect::<Vec<_>>();
+
+        assert_eq!(plan.variable_names().collect::<Vec<_>>(), vec!["X"]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].lookup("X"), Some(&Value::integer(2)));
+        Ok(())
+    }
+
+    #[test]
+    fn planner_orders_relations_after_their_required_facts() -> Result<()> {
+        let storage = InMemoryStorage::from_facts([(
+            "value".to_string(),
+            vec![vec![Value::integer(1)], vec![Value::integer(2)]],
+        )]);
+        let query = parse_query("X > 1, value(X)")?;
+
+        let results = DatafoxClient::new(DatafoxConfig::new(&storage))?
+            .eval(&query)?
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].lookup("X"), Some(&Value::integer(2)));
+        Ok(())
+    }
+
+    #[test]
+    fn planner_rejects_queries_with_no_safe_ordering() -> Result<()> {
+        let storage = InMemoryStorage::new();
+        let query = Query::multi(vec![Clause::builtin(
+            ">",
+            vec![crate::var!("X"), crate::lit!(Value::integer(1))],
+        )])?;
+
+        let error = match DatafoxClient::new(DatafoxConfig::new(&storage))?.plan(&query) {
+            Ok(_) => panic!("unsafe query"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            crate::Error::UngroundedBuiltin {
+                name: ">".to_string(),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn arithmetic_operators_treat_divide_by_zero_as_no_result() -> Result<()> {
+        let storage =
+            InMemoryStorage::from_facts([("value".to_string(), vec![vec![Value::integer(2)]])]);
+        let query = parse_query("value(X), (X / 0) = 1")?;
+
+        let results = DatafoxClient::new(DatafoxConfig::new(&storage))?
+            .eval(&query)?
+            .collect::<Vec<_>>();
+
+        assert!(results.is_empty());
         Ok(())
     }
 
@@ -982,10 +1238,7 @@ mod tests {
         let prelude = Prelude::new().with_fact("threshold", vec![Value::integer(2)]);
         let query = parse_query("value(X), threshold(T), X > T")?;
 
-        let results = Evaluator::builder()
-            .with_store(&storage)
-            .with_prelude(prelude)
-            .build()?
+        let results = DatafoxClient::new(DatafoxConfig::new(&storage).with_prelude(prelude))?
             .eval(&query)?
             .collect::<Vec<_>>();
 
@@ -1005,17 +1258,14 @@ mod tests {
             Prelude::new().with_operator(BinaryOperator::new("plusTen", |left, right| {
                 match (left, right) {
                     (Value::Integer(left), Value::Integer(right)) => {
-                        Some(Value::integer(left + right + 10))
+                        OperatorOutcome::Value(Value::integer(left + right + 10))
                     }
-                    _ => None,
+                    _ => OperatorOutcome::NoResult,
                 }
             }));
         let query = parse_query("value(X), (X plusTen 1) = 14")?;
 
-        let results = Evaluator::builder()
-            .with_store(&storage)
-            .with_prelude(prelude)
-            .build()?
+        let results = DatafoxClient::new(DatafoxConfig::new(&storage).with_prelude(prelude))?
             .eval(&query)?
             .collect::<Vec<_>>();
 
@@ -1048,6 +1298,40 @@ mod tests {
             crate::Error::UngroundedBuiltin {
                 name: "gt".to_string(),
             }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planned_evaluator_matches_source_order_reference_for_safe_queries() -> Result<()> {
+        let storage = InMemoryStorage::from_facts([
+            (
+                "edge".to_string(),
+                vec![
+                    vec![Value::integer(1), Value::integer(2)],
+                    vec![Value::integer(2), Value::integer(3)],
+                    vec![Value::integer(3), Value::integer(4)],
+                ],
+            ),
+            (
+                "name".to_string(),
+                vec![
+                    vec![Value::integer(2), Value::string("rush")],
+                    vec![Value::integer(3), Value::string("yes")],
+                ],
+            ),
+        ]);
+        let query = parse_query(r#"edge(X, Y), name(Y, Name), contains(Name, "s"), Y > 1"#)?;
+
+        let planned = DatafoxClient::new(DatafoxConfig::new(&storage))?
+            .eval(&query)?
+            .collect::<Vec<_>>();
+        let reference =
+            collect_results(Evaluator::evaluate(&Universe::new(storage), &query).await?).await?;
+
+        assert_eq!(
+            normalize_substitutions(planned),
+            normalize_substitutions(reference)
         );
         Ok(())
     }
@@ -1095,15 +1379,10 @@ mod tests {
         ]);
         let query = parse_query(r#"person(Id, Name), !banned(Id), contains(Name, "1")"#)?;
 
-        let sequential = Evaluator::builder()
-            .with_store(&storage)
-            .build()?
+        let sequential = DatafoxClient::new(DatafoxConfig::new(&storage))?
             .eval(&query)?
             .collect::<Vec<_>>();
-        let parallel = Evaluator::builder()
-            .with_store(&storage)
-            .parallel()
-            .build()?
+        let parallel = DatafoxClient::new(DatafoxConfig::new(&storage).parallel())?
             .eval(&query)?
             .collect::<Vec<_>>();
 
@@ -1160,9 +1439,9 @@ mod tests {
                     ),
                 ]);
 
-                let evaluator = Evaluator::builder().with_store(&storage).build().expect("evaluator");
+                let datafox = DatafoxClient::new(DatafoxConfig::new(&storage)).expect("datafox");
                 for query in queries.into_iter().take(16) {
-                    let _ = evaluator.eval(&query);
+                    let _ = datafox.eval(&query);
                 }
             }
         }

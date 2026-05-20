@@ -2,7 +2,7 @@
 
 `datafox` is a small Datalog parser and streaming query engine for querying caller-owned facts.
 
-It was built for lintbook rule evaluation, but the crate is standalone: provide facts through a `Storage`, parse read-only queries, and evaluate substitutions.
+It was built for lintbook rule evaluation, but the crate is standalone: provide facts through a store, parse read-only queries, and evaluate substitutions through a `DatafoxClient`.
 
 ```toml
 [dependencies]
@@ -10,7 +10,7 @@ datafox = "0.1"
 ```
 
 ```rust
-use datafox::{Evaluator, InMemoryStorage, Value, parse_query};
+use datafox::{DatafoxClient, DatafoxConfig, InMemoryStorage, Value, parse_query};
 
 fn main() -> datafox::Result<()> {
     let storage = InMemoryStorage::from_facts([(
@@ -22,8 +22,8 @@ fn main() -> datafox::Result<()> {
     )]);
 
     let query = parse_query("edge(From, 2)")?;
-    let evaluator = Evaluator::builder().with_store(&storage).build()?;
-    let results = evaluator.eval(&query)?.collect::<Vec<_>>();
+    let datafox = DatafoxClient::new(DatafoxConfig::new(&storage))?;
+    let results = datafox.eval(&query)?.collect::<Vec<_>>();
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].lookup("From"), Some(&Value::integer(1)));
@@ -59,17 +59,24 @@ Builtins are available as clauses:
 
 Negated atoms and builtin arguments must be grounded by earlier clauses. Evaluation is read-only and snapshot-oriented; facts are supplied by the caller.
 
-Configure the evaluator runtime profile up front:
+Configure the runtime profile up front:
 
 ```rust
-let evaluator = Evaluator::builder()
-    .with_store(&storage)
+let datafox = DatafoxClient::new(DatafoxConfig::new(&storage)
     .parallel()
     .threads(4)
-    .seed_threshold(1024)
-    .build()?;
+    .seed_threshold(1024))?;
 
-for substitution in evaluator.eval(&query)? {
+for substitution in datafox.eval(&query)? {
+    println!("{substitution}");
+}
+```
+
+For hot paths, plan once and evaluate the validated plan repeatedly:
+
+```rust
+let plan = datafox.plan(&query)?;
+for substitution in datafox.eval_plan(&plan)? {
     println!("{substitution}");
 }
 ```
@@ -77,17 +84,14 @@ for substitution in evaluator.eval(&query)? {
 Add a prelude when the evaluator should see ambient facts, custom relations, or custom expression operators:
 
 ```rust
-use datafox::{BinaryOperator, Evaluator, Prelude, Value};
+use datafox::{BinaryOperator, DatafoxClient, DatafoxConfig, Prelude, Value};
 
 let prelude = Prelude::new()
     .with_fact("threshold", vec![Value::integer(10)])
-    .with_operator(BinaryOperator::new("plusTen", |left, right| match (left, right) {
+    .with_operator(BinaryOperator::from_option("plusTen", |left, right| match (left, right) {
         (Value::Integer(left), Value::Integer(right)) => Some(Value::integer(left + right + 10)),
         _ => None,
     }));
 
-let evaluator = Evaluator::builder()
-    .with_store(&storage)
-    .with_prelude(prelude)
-    .build()?;
+let datafox = DatafoxClient::new(DatafoxConfig::new(&storage).with_prelude(prelude))?;
 ```

@@ -19,13 +19,7 @@ impl Unifier {
             (Term::Var(var), Term::Const(value)) | (Term::Const(value), Term::Var(var)) => {
                 Some(substitution.clone().bind(var, value))
             }
-            (Term::Var(left), Term::Var(right)) => {
-                if left == right {
-                    Some(substitution.clone())
-                } else {
-                    Some(substitution.clone())
-                }
-            }
+            (Term::Var(_), Term::Var(_)) => Some(substitution.clone()),
             (Term::Call { .. }, _) | (_, Term::Call { .. }) => None,
             (Term::Wildcard, _) | (_, Term::Wildcard) => Some(substitution.clone()),
         }
