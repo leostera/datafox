@@ -1,5 +1,6 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use regex::Regex;
 
@@ -203,8 +204,6 @@ impl Default for Prelude {
 }
 
 fn default_relations() -> Vec<BinaryRelation> {
-    let regex_cache = Arc::new(Mutex::new(HashMap::new()));
-
     vec![
         BinaryRelation::from_bool("=", |left, right| left == right),
         BinaryRelation::from_bool("eq", |left, right| left == right),
@@ -256,22 +255,14 @@ fn default_relations() -> Vec<BinaryRelation> {
         BinaryRelation::from_bool("notContains", |left, right| {
             string_args(left, right).is_some_and(|(haystack, needle)| !haystack.contains(needle))
         }),
-        {
-            let regex_cache = Arc::clone(&regex_cache);
-            BinaryRelation::from_bool("matchesRegex", move |left, right| {
-                string_args(left, right).is_some_and(|(haystack, pattern)| {
-                    regex_is_match(&regex_cache, haystack, pattern)
-                })
-            })
-        },
-        {
-            let regex_cache = Arc::clone(&regex_cache);
-            BinaryRelation::from_bool("notMatchesRegex", move |left, right| {
-                string_args(left, right).is_some_and(|(haystack, pattern)| {
-                    !regex_is_match(&regex_cache, haystack, pattern)
-                })
-            })
-        },
+        BinaryRelation::from_bool("matchesRegex", |left, right| {
+            string_args(left, right)
+                .is_some_and(|(haystack, pattern)| regex_is_match(haystack, pattern))
+        }),
+        BinaryRelation::from_bool("notMatchesRegex", |left, right| {
+            string_args(left, right)
+                .is_some_and(|(haystack, pattern)| !regex_is_match(haystack, pattern))
+        }),
     ]
 }
 
@@ -337,18 +328,17 @@ fn string_args<'a>(left: &'a Value, right: &'a Value) -> Option<(&'a str, &'a st
     }
 }
 
-fn regex_is_match(
-    cache: &Mutex<HashMap<String, Option<Regex>>>,
-    haystack: &str,
-    pattern: &str,
-) -> bool {
-    let regex = match cache.lock() {
-        Ok(mut cache) => cache
+thread_local! {
+    static REGEX_CACHE: RefCell<HashMap<String, Option<Regex>>> = RefCell::new(HashMap::new());
+}
+
+fn regex_is_match(haystack: &str, pattern: &str) -> bool {
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache
             .entry(pattern.to_string())
             .or_insert_with(|| Regex::new(pattern).ok())
-            .clone(),
-        Err(_) => Regex::new(pattern).ok(),
-    };
-
-    regex.is_some_and(|regex| regex.is_match(haystack))
+            .as_ref()
+            .is_some_and(|regex| regex.is_match(haystack))
+    })
 }

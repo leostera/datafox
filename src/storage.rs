@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::slice;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -52,7 +53,7 @@ pub trait FactStore {
     fn estimate(&self, predicate: &str, pattern: &[Option<Value>]) -> FactEstimate;
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InMemoryStorage {
     facts: BTreeMap<String, Vec<FactTuple>>,
     indexes: BTreeMap<String, BTreeMap<(usize, Value), Vec<usize>>>,
@@ -95,6 +96,10 @@ impl InMemoryStorage {
         pattern: &[Option<Value>],
     ) -> Vec<&'a FactTuple> {
         self.scan(predicate, pattern).collect()
+    }
+
+    pub fn predicates(&self) -> impl Iterator<Item = &str> {
+        self.facts.keys().map(String::as_str)
     }
 }
 
@@ -294,5 +299,26 @@ mod tests {
 
         assert_eq!(tuples, vec![&vec![Value::integer(2), Value::integer(3)]]);
         assert_eq!(storage.estimate("edge", &pattern).rows, 1);
+    }
+
+    #[test]
+    fn in_memory_storage_can_round_trip_through_serde() {
+        let storage = InMemoryStorage::from_facts([(
+            "edge".to_string(),
+            vec![
+                vec![Value::integer(1), Value::integer(2)],
+                vec![Value::integer(2), Value::integer(3)],
+            ],
+        )]);
+
+        let encoded = bincode::serialize(&storage).expect("encoded storage");
+        let decoded: InMemoryStorage = bincode::deserialize(&encoded).expect("decoded storage");
+        let pattern = vec![Some(Value::integer(2)), None];
+
+        assert_eq!(
+            decoded.scan("edge", &pattern).collect::<Vec<_>>(),
+            vec![&vec![Value::integer(2), Value::integer(3)]]
+        );
+        assert_eq!(decoded.estimate("edge", &pattern).rows, 1);
     }
 }
