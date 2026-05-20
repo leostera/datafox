@@ -311,8 +311,12 @@ mod tests {
             ],
         )]);
 
-        let encoded = bincode::serialize(&storage).expect("encoded storage");
-        let decoded: InMemoryStorage = bincode::deserialize(&encoded).expect("decoded storage");
+        let encoded = bincode::serde::encode_to_vec(&storage, bincode::config::legacy())
+            .expect("encoded storage");
+        let (decoded, bytes_read): (InMemoryStorage, usize) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::legacy())
+                .expect("decoded storage");
+        assert_eq!(bytes_read, encoded.len());
         let pattern = vec![Some(Value::integer(2)), None];
 
         assert_eq!(
