@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 #[cfg(test)]
 use tracing::debug;
 
-use crate::plan::{PlannedAtom, PlannedClause, PlannedRelation, PlannedTerm, VariableId};
+use crate::plan::{
+    ExecutablePlan, PlannedAtom, PlannedClause, PlannedRelation, PlannedTerm, VariableId,
+};
 use crate::{
     Error, FactStore, InMemoryStorage, OperatorOutcome, Plan, Prelude, Result, Substitution, Value,
 };
@@ -74,7 +76,7 @@ impl PlanSeed {
         }
     }
 
-    fn into_substitution(self, plan: &Plan) -> Substitution {
+    fn into_substitution(self, plan: &ExecutablePlan<'_>) -> Substitution {
         Substitution::from_bindings(self.bindings.into_iter().enumerate().filter_map(
             |(index, value)| {
                 value.map(|value| {
@@ -215,9 +217,10 @@ impl<'store> Evaluator<'store> {
     }
 
     pub(crate) fn eval_plan(&self, plan: &Plan) -> Result<Evaluation> {
+        let executable = plan.bind(&self.prelude)?;
         let seeds = match self.strategy {
             EvaluationStrategy::Serial => {
-                Self::evaluate_plan_serial(self.storage, &self.prelude, plan)?
+                Self::evaluate_plan_serial(self.storage, &self.prelude, &executable)?
             }
             EvaluationStrategy::Parallel { seed_threshold } => {
                 let Some(pool) = &self.pool else {
@@ -227,14 +230,19 @@ impl<'store> Evaluator<'store> {
                     });
                 };
                 pool.install(|| {
-                    Self::evaluate_plan_parallel(self.storage, &self.prelude, plan, seed_threshold)
+                    Self::evaluate_plan_parallel(
+                        self.storage,
+                        &self.prelude,
+                        &executable,
+                        seed_threshold,
+                    )
                 })?
             }
         };
 
         let substitutions = seeds
             .into_iter()
-            .map(|seed| seed.into_substitution(plan))
+            .map(|seed| seed.into_substitution(&executable))
             .collect();
         Ok(Evaluation::new(substitutions))
     }
@@ -371,7 +379,7 @@ impl<'store> Evaluator<'store> {
     fn evaluate_plan_serial(
         storage: &InMemoryStorage,
         prelude: &Prelude,
-        plan: &Plan,
+        plan: &ExecutablePlan<'_>,
     ) -> Result<Vec<PlanSeed>> {
         let mut seeds = vec![PlanSeed::new(plan.variable_count())];
 
@@ -415,7 +423,7 @@ impl<'store> Evaluator<'store> {
     fn evaluate_plan_parallel(
         storage: &InMemoryStorage,
         prelude: &Prelude,
-        plan: &Plan,
+        plan: &ExecutablePlan<'_>,
         seed_threshold: usize,
     ) -> Result<Vec<PlanSeed>> {
         let mut seeds = vec![PlanSeed::new(plan.variable_count())];
@@ -435,7 +443,7 @@ impl<'store> Evaluator<'store> {
     fn advance_planned_clause(
         storage: &InMemoryStorage,
         prelude: &Prelude,
-        plan: &Plan,
+        plan: &ExecutablePlan<'_>,
         clause: &PlannedClause,
         seeds: Vec<PlanSeed>,
     ) -> Result<Vec<PlanSeed>> {
@@ -475,7 +483,7 @@ impl<'store> Evaluator<'store> {
     fn advance_planned_clause_parallel(
         storage: &InMemoryStorage,
         prelude: &Prelude,
-        plan: &Plan,
+        plan: &ExecutablePlan<'_>,
         clause: &PlannedClause,
         seeds: Vec<PlanSeed>,
     ) -> Result<Vec<PlanSeed>> {
@@ -508,7 +516,7 @@ impl<'store> Evaluator<'store> {
     fn query_planned_atom_matches(
         storage: &InMemoryStorage,
         prelude: &Prelude,
-        plan: &Plan,
+        plan: &ExecutablePlan<'_>,
         atom: &PlannedAtom,
         seed: &PlanSeed,
     ) -> Result<Vec<PlanSeed>> {
@@ -609,7 +617,7 @@ enum EvaluatedTerm {
 fn planned_atom_to_pattern(
     atom: &PlannedAtom,
     seed: &PlanSeed,
-    plan: &Plan,
+    plan: &ExecutablePlan<'_>,
 ) -> Result<Vec<Option<Value>>> {
     atom.args
         .iter()
@@ -624,7 +632,7 @@ fn match_planned_atom(
     seed: &PlanSeed,
     atom: &PlannedAtom,
     tuple: &[Value],
-    plan: &Plan,
+    plan: &ExecutablePlan<'_>,
 ) -> Result<Option<PlanSeed>> {
     if atom.args.len() != tuple.len() {
         return Err(Error::ArityMismatch {
@@ -658,7 +666,7 @@ fn match_planned_atom(
 fn evaluate_planned_relation(
     relation: &PlannedRelation,
     seed: &PlanSeed,
-    plan: &Plan,
+    plan: &ExecutablePlan<'_>,
 ) -> Result<bool> {
     let [left, right] = relation.args.as_slice() else {
         return Err(Error::BuiltinArityMismatch {
@@ -687,7 +695,7 @@ fn evaluate_planned_relation(
 fn evaluate_planned_term(
     term: &PlannedTerm,
     seed: &PlanSeed,
-    plan: &Plan,
+    plan: &ExecutablePlan<'_>,
 ) -> Result<EvaluatedTerm> {
     match term {
         PlannedTerm::Const(value) => Ok(EvaluatedTerm::Value(plan.value(*value).clone())),

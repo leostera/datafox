@@ -38,6 +38,10 @@ pub enum Error {
     Parse { diagnostics: Vec<Diagnostic> },
     #[error("failed to build evaluator: {message}")]
     EvaluatorBuild { message: String },
+    #[error("unsupported prepared query format version {found}; expected {expected}")]
+    PreparedQueryFormat { expected: u32, found: u32 },
+    #[error("invalid prepared query: {message}")]
+    InvalidPreparedQuery { message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

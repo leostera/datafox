@@ -30,7 +30,8 @@
 //! - [`Atom`], [`Clause`], and [`Query`] for query syntax trees.
 //! - [`Diagnostic`] and [`parse_query`] for query parsing with context.
 //! - [`Substitution`] and [`Unifier`] for binding and matching query variables.
-//! - [`DatafoxClient`], [`DatafoxConfig`], [`Planner`], [`Plan`], and [`Storage`]
+//! - [`DatafoxClient`], [`DatafoxConfig`], [`DatafoxEnvironment`],
+//!   [`PreparedQuery`], [`PlanningCache`], [`Planner`], [`Plan`], and [`Storage`]
 //!   for snapshot-based query execution.
 //! - [`Prelude`], [`BinaryRelation`], and [`BinaryOperator`] for ambient facts,
 //!   builtin relations, and expression operators.
@@ -53,12 +54,14 @@ mod universe;
 mod value;
 
 pub use ast::{Atom, Clause, Query};
-pub use client::{DatafoxClient, DatafoxConfig};
+pub use client::{
+    DatafoxClient, DatafoxConfig, DatafoxEnvironment, DatafoxEnvironmentBuilder, PlanningCache,
+};
 pub use diagnostic::{Diagnostic, Span};
 pub use error::{Error, Result};
 pub use evaluator::{Evaluation, EvaluationStrategy};
 pub use parser::{parse_queries, parse_query};
-pub use plan::{Plan, Planner};
+pub use plan::{PREPARED_QUERY_FORMAT_VERSION, Plan, Planner, PreparedQuery};
 pub use prelude::{BinaryOperator, BinaryRelation, OperatorOutcome, Prelude, RelationOutcome};
 pub use storage::{
     FactEstimate, FactScan, FactStore, FactTuple, InMemoryStorage, Storage, TupleStream,

@@ -72,13 +72,29 @@ for substitution in datafox.eval(&query)? {
 }
 ```
 
-For hot paths, plan once and evaluate the validated plan repeatedly:
+For hot paths, prepare once and evaluate the validated prepared query repeatedly:
 
 ```rust
-let plan = datafox.plan(&query)?;
-for substitution in datafox.eval_plan(&plan)? {
+let prepared = datafox.prepare(&query)?;
+for substitution in datafox.eval_prepared(&prepared)? {
     println!("{substitution}");
 }
+```
+
+Prepared queries are pure data, so they can be serialized and loaded later. The runtime
+binds relation and operator names from the active prelude when evaluation starts.
+
+Use an environment with a planning cache when many clients should share prepared queries:
+
+```rust
+use datafox::{DatafoxEnvironment, PlanningCache};
+
+let environment = DatafoxEnvironment::builder()
+    .with_planning_cache(PlanningCache::unbounded())
+    .build();
+let prepared = environment.prepare(&query)?;
+let datafox = environment.client(DatafoxConfig::new(&storage))?;
+let results = datafox.eval_prepared(&prepared)?.collect::<Vec<_>>();
 ```
 
 Add a prelude when the evaluator should see ambient facts, custom relations, or custom expression operators:

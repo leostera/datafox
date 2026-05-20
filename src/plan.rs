@@ -1,12 +1,16 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     Atom, BinaryOperator, BinaryRelation, Clause, Error, FactStore, InMemoryStorage, Prelude,
     Query, Result, Term, Value,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub const PREPARED_QUERY_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct VariableId(usize);
 
 impl VariableId {
@@ -19,7 +23,7 @@ impl VariableId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PredicateId(usize);
 
 impl PredicateId {
@@ -28,7 +32,7 @@ impl PredicateId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ValueId(usize);
 
 impl ValueId {
@@ -37,51 +41,152 @@ impl ValueId {
     }
 }
 
-#[derive(Clone)]
-pub struct Plan {
-    clauses: Vec<PlannedClause>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedQuery {
+    format_version: u32,
+    clauses: Vec<PreparedClause>,
     variables: Vec<String>,
     predicates: Vec<String>,
     values: Vec<Value>,
+    required_relations: BTreeSet<String>,
+    required_operators: BTreeSet<String>,
 }
 
-impl Plan {
+pub type Plan = PreparedQuery;
+
+impl PreparedQuery {
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
     pub fn variable_names(&self) -> impl Iterator<Item = &str> {
         self.variables.iter().map(String::as_str)
     }
 
+    pub fn required_relations(&self) -> impl Iterator<Item = &str> {
+        self.required_relations.iter().map(String::as_str)
+    }
+
+    pub fn required_operators(&self) -> impl Iterator<Item = &str> {
+        self.required_operators.iter().map(String::as_str)
+    }
+
+    pub(crate) fn bind<'a>(&'a self, prelude: &Prelude) -> Result<ExecutablePlan<'a>> {
+        self.validate()?;
+        self.validate_prelude(prelude)?;
+
+        let clauses = self
+            .clauses
+            .iter()
+            .map(|clause| bind_clause(clause, prelude))
+            .collect::<Result<_>>()?;
+
+        Ok(ExecutablePlan {
+            prepared: self,
+            clauses,
+        })
+    }
+
+    pub(crate) fn validate_prelude(&self, prelude: &Prelude) -> Result<()> {
+        for relation in &self.required_relations {
+            if prelude.relation(relation).is_none() {
+                return Err(Error::UnsupportedBuiltin {
+                    name: relation.clone(),
+                });
+            }
+        }
+
+        for operator in &self.required_operators {
+            if prelude.operator(operator).is_none() {
+                return Err(Error::UnsupportedBuiltin {
+                    name: operator.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.format_version != PREPARED_QUERY_FORMAT_VERSION {
+            return Err(Error::PreparedQueryFormat {
+                expected: PREPARED_QUERY_FORMAT_VERSION,
+                found: self.format_version,
+            });
+        }
+
+        for clause in &self.clauses {
+            validate_clause(clause, self)?;
+        }
+
+        Ok(())
+    }
+
+    fn variable_count(&self) -> usize {
+        self.variables.len()
+    }
+
+    fn variable_name(&self, variable: VariableId) -> &str {
+        &self.variables[variable.index()]
+    }
+
+    fn predicate_name(&self, predicate: PredicateId) -> &str {
+        &self.predicates[predicate.index()]
+    }
+
+    fn value(&self, value: ValueId) -> &Value {
+        &self.values[value.index()]
+    }
+}
+
+pub(crate) struct ExecutablePlan<'a> {
+    prepared: &'a PreparedQuery,
+    clauses: Vec<PlannedClause>,
+}
+
+impl ExecutablePlan<'_> {
     pub(crate) fn clauses(&self) -> &[PlannedClause] {
         &self.clauses
     }
 
     pub(crate) fn variable_count(&self) -> usize {
-        self.variables.len()
+        self.prepared.variable_count()
     }
 
     pub(crate) fn variable_name(&self, variable: VariableId) -> &str {
-        &self.variables[variable.index()]
+        self.prepared.variable_name(variable)
     }
 
     pub(crate) fn predicate_name(&self, predicate: PredicateId) -> &str {
-        &self.predicates[predicate.index()]
+        self.prepared.predicate_name(predicate)
     }
 
     pub(crate) fn value(&self, value: ValueId) -> &Value {
-        &self.values[value.index()]
+        self.prepared.value(value)
     }
 }
 
 pub struct Planner<'a> {
-    storage: &'a InMemoryStorage,
+    storage: Option<&'a InMemoryStorage>,
     prelude: &'a Prelude,
 }
 
 impl<'a> Planner<'a> {
     pub fn new(storage: &'a InMemoryStorage, prelude: &'a Prelude) -> Self {
-        Self { storage, prelude }
+        Self {
+            storage: Some(storage),
+            prelude,
+        }
     }
 
-    pub fn plan(&self, query: &Query) -> Result<Plan> {
+    pub fn for_prelude(prelude: &'a Prelude) -> Self {
+        Self {
+            storage: None,
+            prelude,
+        }
+    }
+
+    pub fn plan(&self, query: &Query) -> Result<PreparedQuery> {
         let mut context = PlanContext::default();
         let mut clauses = Vec::new();
 
@@ -90,11 +195,14 @@ impl<'a> Planner<'a> {
         }
 
         let ordered = self.order_clauses(&context, clauses)?;
-        Ok(Plan {
+        Ok(PreparedQuery {
+            format_version: PREPARED_QUERY_FORMAT_VERSION,
             clauses: ordered.into_iter().map(|clause| clause.clause).collect(),
             variables: context.variables,
             predicates: context.predicates,
             values: context.values,
+            required_relations: context.required_relations,
+            required_operators: context.required_operators,
         })
     }
 
@@ -113,7 +221,7 @@ impl<'a> Planner<'a> {
                     original_index,
                     requires,
                     binds,
-                    clause: PlannedClause::Atom(atom),
+                    clause: PreparedClause::Atom(atom),
                 }
             }
             Clause::Negated(atom) => {
@@ -122,13 +230,13 @@ impl<'a> Planner<'a> {
                     original_index,
                     requires: atom.variables(),
                     binds: BTreeSet::new(),
-                    clause: PlannedClause::Negated(atom),
+                    clause: PreparedClause::Negated(atom),
                 }
             }
             Clause::Builtin { name, args } => {
-                let Some(relation) = self.prelude.relation(name).cloned() else {
+                if self.prelude.relation(name).is_none() {
                     return Err(Error::UnsupportedBuiltin { name: name.clone() });
-                };
+                }
                 if args.len() != 2 {
                     return Err(Error::BuiltinArityMismatch {
                         name: name.clone(),
@@ -141,14 +249,14 @@ impl<'a> Planner<'a> {
                     .iter()
                     .map(|term| self.lower_term(context, term))
                     .collect::<Result<Vec<_>>>()?;
-                let requires = args.iter().flat_map(PlannedTerm::variables).collect();
+                let requires = args.iter().flat_map(PreparedTerm::variables).collect();
+                context.required_relations.insert(name.clone());
                 CandidateClause {
                     original_index,
                     requires,
                     binds: BTreeSet::new(),
-                    clause: PlannedClause::Relation(PlannedRelation {
+                    clause: PreparedClause::Relation(PreparedRelation {
                         name: name.clone(),
-                        relation,
                         args,
                     }),
                 }
@@ -158,8 +266,8 @@ impl<'a> Planner<'a> {
         Ok(clause)
     }
 
-    fn lower_atom(&self, context: &mut PlanContext, atom: &Atom) -> Result<PlannedAtom> {
-        Ok(PlannedAtom {
+    fn lower_atom(&self, context: &mut PlanContext, atom: &Atom) -> Result<PreparedAtom> {
+        Ok(PreparedAtom {
             predicate: context.intern_predicate(&atom.predicate),
             args: atom
                 .args
@@ -169,15 +277,15 @@ impl<'a> Planner<'a> {
         })
     }
 
-    fn lower_term(&self, context: &mut PlanContext, term: &Term) -> Result<PlannedTerm> {
+    fn lower_term(&self, context: &mut PlanContext, term: &Term) -> Result<PreparedTerm> {
         match term {
-            Term::Var(name) => Ok(PlannedTerm::Var(context.intern_variable(name))),
-            Term::Const(value) => Ok(PlannedTerm::Const(context.intern_value(value.clone()))),
-            Term::Wildcard => Ok(PlannedTerm::Wildcard),
+            Term::Var(name) => Ok(PreparedTerm::Var(context.intern_variable(name))),
+            Term::Const(value) => Ok(PreparedTerm::Const(context.intern_value(value.clone()))),
+            Term::Wildcard => Ok(PreparedTerm::Wildcard),
             Term::Call { name, args } => {
-                let Some(operator) = self.prelude.operator(name).cloned() else {
+                if self.prelude.operator(name).is_none() {
                     return Err(Error::UnsupportedBuiltin { name: name.clone() });
-                };
+                }
                 if args.len() != 2 {
                     return Err(Error::BuiltinArityMismatch {
                         name: name.clone(),
@@ -186,9 +294,9 @@ impl<'a> Planner<'a> {
                     });
                 }
 
-                Ok(PlannedTerm::Call {
+                context.required_operators.insert(name.clone());
+                Ok(PreparedTerm::Call {
                     name: name.clone(),
-                    operator,
                     args: args
                         .iter()
                         .map(|term| self.lower_term(context, term))
@@ -235,6 +343,8 @@ struct PlanContext {
     predicates: Vec<String>,
     values_by_value: BTreeMap<Value, ValueId>,
     values: Vec<Value>,
+    required_relations: BTreeSet<String>,
+    required_operators: BTreeSet<String>,
 }
 
 impl PlanContext {
@@ -281,14 +391,14 @@ struct CandidateClause {
     original_index: usize,
     requires: BTreeSet<VariableId>,
     binds: BTreeSet<VariableId>,
-    clause: PlannedClause,
+    clause: PreparedClause,
 }
 
 impl CandidateClause {
     fn order_key(
         &self,
         context: &PlanContext,
-        storage: &InMemoryStorage,
+        storage: Option<&InMemoryStorage>,
         prelude: &Prelude,
         bound: &BTreeSet<VariableId>,
     ) -> (bool, Reverse<usize>, usize, usize) {
@@ -313,11 +423,11 @@ impl CandidateClause {
 
     fn variables(&self) -> BTreeSet<VariableId> {
         match &self.clause {
-            PlannedClause::Atom(atom) | PlannedClause::Negated(atom) => atom.variables(),
-            PlannedClause::Relation(relation) => relation
+            PreparedClause::Atom(atom) | PreparedClause::Negated(atom) => atom.variables(),
+            PreparedClause::Relation(relation) => relation
                 .args
                 .iter()
-                .flat_map(PlannedTerm::variables)
+                .flat_map(PreparedTerm::variables)
                 .collect(),
         }
     }
@@ -325,33 +435,112 @@ impl CandidateClause {
     fn estimated_rows(
         &self,
         context: &PlanContext,
-        storage: &InMemoryStorage,
+        storage: Option<&InMemoryStorage>,
         prelude: &Prelude,
         bound: &BTreeSet<VariableId>,
     ) -> usize {
         match &self.clause {
-            PlannedClause::Atom(atom) | PlannedClause::Negated(atom) => {
+            PreparedClause::Atom(atom) | PreparedClause::Negated(atom) => {
                 let predicate = context.predicate_name(atom.predicate);
                 let pattern = atom.estimate_pattern(context, bound);
-                storage.estimate(predicate, &pattern).rows
+                storage.map_or(0, |storage| storage.estimate(predicate, &pattern).rows)
                     + prelude.facts().estimate(predicate, &pattern).rows
             }
-            PlannedClause::Relation(_) => 0,
+            PreparedClause::Relation(_) => 0,
         }
     }
 }
 
 fn blocked_clause_error(clause: &CandidateClause, context: &PlanContext) -> Error {
     match &clause.clause {
-        PlannedClause::Atom(atom) => Error::UngroundedBuiltin {
+        PreparedClause::Atom(atom) => Error::UngroundedBuiltin {
             name: context.predicate_name(atom.predicate).to_string(),
         },
-        PlannedClause::Negated(atom) => Error::UngroundedBuiltin {
+        PreparedClause::Negated(atom) => Error::UngroundedBuiltin {
             name: format!("!{}", context.predicate_name(atom.predicate)),
         },
-        PlannedClause::Relation(relation) => Error::UngroundedBuiltin {
+        PreparedClause::Relation(relation) => Error::UngroundedBuiltin {
             name: relation.name.clone(),
         },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum PreparedClause {
+    Atom(PreparedAtom),
+    Negated(PreparedAtom),
+    Relation(PreparedRelation),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PreparedAtom {
+    predicate: PredicateId,
+    args: Vec<PreparedTerm>,
+}
+
+impl PreparedAtom {
+    fn bound_direct_variables(&self) -> BTreeSet<VariableId> {
+        self.args
+            .iter()
+            .filter_map(|term| match term {
+                PreparedTerm::Var(variable) => Some(*variable),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn expression_variables(&self) -> BTreeSet<VariableId> {
+        self.args
+            .iter()
+            .filter(|term| matches!(term, PreparedTerm::Call { .. }))
+            .flat_map(PreparedTerm::variables)
+            .collect()
+    }
+
+    fn variables(&self) -> BTreeSet<VariableId> {
+        self.args.iter().flat_map(PreparedTerm::variables).collect()
+    }
+
+    fn estimate_pattern(
+        &self,
+        context: &PlanContext,
+        bound: &BTreeSet<VariableId>,
+    ) -> Vec<Option<Value>> {
+        self.args
+            .iter()
+            .map(|term| match term {
+                PreparedTerm::Const(value) => Some(context.values[value.index()].clone()),
+                PreparedTerm::Var(variable) if bound.contains(variable) => None,
+                PreparedTerm::Var(_) | PreparedTerm::Call { .. } | PreparedTerm::Wildcard => None,
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PreparedRelation {
+    name: String,
+    args: Vec<PreparedTerm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum PreparedTerm {
+    Var(VariableId),
+    Const(ValueId),
+    Call {
+        name: String,
+        args: Vec<PreparedTerm>,
+    },
+    Wildcard,
+}
+
+impl PreparedTerm {
+    fn variables(&self) -> BTreeSet<VariableId> {
+        match self {
+            Self::Var(variable) => BTreeSet::from([*variable]),
+            Self::Const(_) | Self::Wildcard => BTreeSet::new(),
+            Self::Call { args, .. } => args.iter().flat_map(Self::variables).collect(),
+        }
     }
 }
 
@@ -366,45 +555,6 @@ pub(crate) enum PlannedClause {
 pub(crate) struct PlannedAtom {
     pub(crate) predicate: PredicateId,
     pub(crate) args: Vec<PlannedTerm>,
-}
-
-impl PlannedAtom {
-    fn bound_direct_variables(&self) -> BTreeSet<VariableId> {
-        self.args
-            .iter()
-            .filter_map(|term| match term {
-                PlannedTerm::Var(variable) => Some(*variable),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn expression_variables(&self) -> BTreeSet<VariableId> {
-        self.args
-            .iter()
-            .filter(|term| matches!(term, PlannedTerm::Call { .. }))
-            .flat_map(PlannedTerm::variables)
-            .collect()
-    }
-
-    fn variables(&self) -> BTreeSet<VariableId> {
-        self.args.iter().flat_map(PlannedTerm::variables).collect()
-    }
-
-    fn estimate_pattern(
-        &self,
-        context: &PlanContext,
-        bound: &BTreeSet<VariableId>,
-    ) -> Vec<Option<Value>> {
-        self.args
-            .iter()
-            .map(|term| match term {
-                PlannedTerm::Const(value) => Some(context.values[value.index()].clone()),
-                PlannedTerm::Var(variable) if bound.contains(variable) => None,
-                PlannedTerm::Var(_) | PlannedTerm::Call { .. } | PlannedTerm::Wildcard => None,
-            })
-            .collect()
-    }
 }
 
 #[derive(Clone)]
@@ -426,13 +576,93 @@ pub(crate) enum PlannedTerm {
     Wildcard,
 }
 
-impl PlannedTerm {
-    pub(crate) fn variables(&self) -> BTreeSet<VariableId> {
-        match self {
-            Self::Var(variable) => BTreeSet::from([*variable]),
-            Self::Const(_) | Self::Wildcard => BTreeSet::new(),
-            Self::Call { args, .. } => args.iter().flat_map(Self::variables).collect(),
+fn bind_clause(clause: &PreparedClause, prelude: &Prelude) -> Result<PlannedClause> {
+    Ok(match clause {
+        PreparedClause::Atom(atom) => PlannedClause::Atom(bind_atom(atom, prelude)?),
+        PreparedClause::Negated(atom) => PlannedClause::Negated(bind_atom(atom, prelude)?),
+        PreparedClause::Relation(relation) => {
+            let Some(binary_relation) = prelude.relation(&relation.name).cloned() else {
+                return Err(Error::UnsupportedBuiltin {
+                    name: relation.name.clone(),
+                });
+            };
+
+            PlannedClause::Relation(PlannedRelation {
+                name: relation.name.clone(),
+                relation: binary_relation,
+                args: bind_terms(&relation.args, prelude)?,
+            })
         }
+    })
+}
+
+fn bind_atom(atom: &PreparedAtom, prelude: &Prelude) -> Result<PlannedAtom> {
+    Ok(PlannedAtom {
+        predicate: atom.predicate,
+        args: bind_terms(&atom.args, prelude)?,
+    })
+}
+
+fn bind_terms(terms: &[PreparedTerm], prelude: &Prelude) -> Result<Vec<PlannedTerm>> {
+    terms.iter().map(|term| bind_term(term, prelude)).collect()
+}
+
+fn bind_term(term: &PreparedTerm, prelude: &Prelude) -> Result<PlannedTerm> {
+    Ok(match term {
+        PreparedTerm::Var(variable) => PlannedTerm::Var(*variable),
+        PreparedTerm::Const(value) => PlannedTerm::Const(*value),
+        PreparedTerm::Wildcard => PlannedTerm::Wildcard,
+        PreparedTerm::Call { name, args } => {
+            let Some(operator) = prelude.operator(name).cloned() else {
+                return Err(Error::UnsupportedBuiltin { name: name.clone() });
+            };
+            PlannedTerm::Call {
+                name: name.clone(),
+                operator,
+                args: bind_terms(args, prelude)?,
+            }
+        }
+    })
+}
+
+fn validate_clause(clause: &PreparedClause, prepared: &PreparedQuery) -> Result<()> {
+    match clause {
+        PreparedClause::Atom(atom) | PreparedClause::Negated(atom) => validate_atom(atom, prepared),
+        PreparedClause::Relation(relation) => validate_terms(&relation.args, prepared),
+    }
+}
+
+fn validate_atom(atom: &PreparedAtom, prepared: &PreparedQuery) -> Result<()> {
+    if atom.predicate.index() >= prepared.predicates.len() {
+        return Err(Error::InvalidPreparedQuery {
+            message: format!("predicate id {} is out of bounds", atom.predicate.index()),
+        });
+    }
+
+    validate_terms(&atom.args, prepared)
+}
+
+fn validate_terms(terms: &[PreparedTerm], prepared: &PreparedQuery) -> Result<()> {
+    for term in terms {
+        validate_term(term, prepared)?;
+    }
+    Ok(())
+}
+
+fn validate_term(term: &PreparedTerm, prepared: &PreparedQuery) -> Result<()> {
+    match term {
+        PreparedTerm::Var(variable) if variable.index() >= prepared.variables.len() => {
+            Err(Error::InvalidPreparedQuery {
+                message: format!("variable id {} is out of bounds", variable.index()),
+            })
+        }
+        PreparedTerm::Const(value) if value.index() >= prepared.values.len() => {
+            Err(Error::InvalidPreparedQuery {
+                message: format!("value id {} is out of bounds", value.index()),
+            })
+        }
+        PreparedTerm::Call { args, .. } => validate_terms(args, prepared),
+        PreparedTerm::Var(_) | PreparedTerm::Const(_) | PreparedTerm::Wildcard => Ok(()),
     }
 }
 
@@ -440,7 +670,7 @@ impl PlannedTerm {
 mod tests {
     use crate::{InMemoryStorage, Planner, Prelude, Result, Value, parse_query};
 
-    use super::PlannedClause;
+    use super::{PREPARED_QUERY_FORMAT_VERSION, PreparedClause};
 
     #[test]
     fn planner_prefers_connected_clauses_after_binding_variables() -> Result<()> {
@@ -461,12 +691,46 @@ mod tests {
             .clauses
             .iter()
             .filter_map(|clause| match clause {
-                PlannedClause::Atom(atom) => Some(plan.predicate_name(atom.predicate)),
-                PlannedClause::Negated(_) | PlannedClause::Relation(_) => None,
+                PreparedClause::Atom(atom) => Some(plan.predicate_name(atom.predicate)),
+                PreparedClause::Negated(_) | PreparedClause::Relation(_) => None,
             })
             .collect::<Vec<_>>();
 
         assert_eq!(predicates, vec!["root", "child", "small"]);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_queries_track_required_builtins() -> Result<()> {
+        let prelude = Prelude::new();
+        let query = parse_query("value(X), (X + 1) > 3")?;
+
+        let plan = Planner::for_prelude(&prelude).plan(&query)?;
+
+        assert_eq!(plan.format_version(), PREPARED_QUERY_FORMAT_VERSION);
+        assert_eq!(plan.required_relations().collect::<Vec<_>>(), vec![">"]);
+        assert_eq!(plan.required_operators().collect::<Vec<_>>(), vec!["+"]);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_queries_can_be_serialized_and_reloaded() -> Result<()> {
+        let storage = InMemoryStorage::from_facts([(
+            "value".to_string(),
+            vec![vec![Value::integer(1)], vec![Value::integer(2)]],
+        )]);
+        let prelude = Prelude::new();
+        let query = parse_query("value(X), X > 1")?;
+        let prepared = Planner::for_prelude(&prelude).plan(&query)?;
+
+        let encoded = serde_json::to_string(&prepared).expect("prepared query json");
+        let decoded = serde_json::from_str(&encoded).expect("decoded prepared query");
+        let datafox = crate::DatafoxClient::new(crate::DatafoxConfig::new(&storage))?;
+
+        let results = datafox.eval_prepared(&decoded)?.collect::<Vec<_>>();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].lookup("X"), Some(&Value::integer(2)));
         Ok(())
     }
 }
