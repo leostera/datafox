@@ -55,3 +55,5 @@ Builtins are available as clauses:
 | Temporal aliases | `before(Start, End)`, `after(End, Start)` |
 
 Negated atoms and builtin arguments must be grounded by earlier clauses. Evaluation is read-only and snapshot-oriented; facts are supplied by the caller.
+
+For CPU-heavy in-memory workloads, `Evaluator::evaluate_in_memory_parallel` evaluates each clause frontier across a Rayon worker pool once the intermediate seed set is large enough to amortize scheduling overhead.

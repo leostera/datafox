@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use regex::Regex;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -11,6 +12,7 @@ use crate::{
 pub type SubstitutionStream = mpsc::Receiver<Result<Substitution>>;
 
 const DEFAULT_STREAM_BUFFER: usize = 64;
+const PARALLEL_SEED_THRESHOLD: usize = 1024;
 
 /// Query-only evaluator over a snapshot universe.
 pub struct Evaluator;
@@ -36,6 +38,13 @@ impl Evaluator {
     ) -> Result<Vec<Substitution>> {
         let mut regex_cache = HashMap::new();
         Self::evaluate_clauses_in_memory(storage, query.clauses(), &mut regex_cache)
+    }
+
+    pub fn evaluate_in_memory_parallel(
+        storage: &InMemoryStorage,
+        query: &Query,
+    ) -> Result<Vec<Substitution>> {
+        Self::evaluate_clauses_in_memory_parallel(storage, query.clauses())
     }
 
     async fn evaluate_query<S>(universe: Universe<S>, query: Query) -> Result<SubstitutionStream>
@@ -190,6 +199,95 @@ impl Evaluator {
         Ok(seeds)
     }
 
+    fn evaluate_clauses_in_memory_parallel(
+        storage: &InMemoryStorage,
+        clauses: Vec<Clause>,
+    ) -> Result<Vec<Substitution>> {
+        let mut seeds = vec![Substitution::new()];
+
+        for clause in clauses {
+            if seeds.len() < PARALLEL_SEED_THRESHOLD {
+                let mut regex_cache = HashMap::new();
+                seeds = Self::advance_clause_in_memory(storage, clause, seeds, &mut regex_cache)?;
+                continue;
+            }
+
+            seeds = Self::advance_clause_in_memory_parallel(storage, clause, seeds)?;
+        }
+
+        Ok(seeds)
+    }
+
+    fn advance_clause_in_memory(
+        storage: &InMemoryStorage,
+        clause: Clause,
+        seeds: Vec<Substitution>,
+        regex_cache: &mut HashMap<String, Regex>,
+    ) -> Result<Vec<Substitution>> {
+        let atom = match clause {
+            Clause::Atom(atom) => atom,
+            Clause::Negated(atom) => {
+                let mut next_seeds = Vec::new();
+                for seed in seeds {
+                    ensure_negation_is_grounded(&atom, &seed)?;
+
+                    let matches = Self::query_atom_matches_in_memory(storage, &atom, &seed)?;
+                    if matches.is_empty() {
+                        next_seeds.push(seed);
+                    }
+                }
+                return Ok(next_seeds);
+            }
+            Clause::Builtin { name, args } => {
+                let mut next_seeds = Vec::new();
+                for seed in seeds {
+                    if Self::evaluate_builtin_clause_cached(&name, &args, &seed, regex_cache)? {
+                        next_seeds.push(seed);
+                    }
+                }
+                return Ok(next_seeds);
+            }
+        };
+
+        let mut next_seeds = Vec::new();
+        for seed in seeds {
+            next_seeds.extend(Self::query_atom_matches_in_memory(storage, &atom, &seed)?);
+        }
+        Ok(next_seeds)
+    }
+
+    fn advance_clause_in_memory_parallel(
+        storage: &InMemoryStorage,
+        clause: Clause,
+        seeds: Vec<Substitution>,
+    ) -> Result<Vec<Substitution>> {
+        match clause {
+            Clause::Atom(atom) => seeds
+                .into_par_iter()
+                .map(|seed| Self::query_atom_matches_in_memory(storage, &atom, &seed))
+                .collect::<Result<Vec<_>>>()
+                .map(flatten_chunks),
+            Clause::Negated(atom) => seeds
+                .into_par_iter()
+                .map(|seed| {
+                    ensure_negation_is_grounded(&atom, &seed)?;
+
+                    let matches = Self::query_atom_matches_in_memory(storage, &atom, &seed)?;
+                    Ok(matches.is_empty().then_some(seed))
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(flatten_options),
+            Clause::Builtin { name, args } => seeds
+                .into_par_iter()
+                .map_init(HashMap::new, |regex_cache, seed| {
+                    Self::evaluate_builtin_clause_cached(&name, &args, &seed, regex_cache)
+                        .map(|keep| keep.then_some(seed))
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(flatten_options),
+        }
+    }
+
     fn evaluate_builtin_clause(
         name: &str,
         args: &[crate::Term],
@@ -325,6 +423,31 @@ fn atom_to_pattern(atom: &Atom, seed: &Substitution) -> Vec<Option<Value>> {
             crate::Term::Wildcard => None,
         })
         .collect()
+}
+
+fn ensure_negation_is_grounded(atom: &Atom, seed: &Substitution) -> Result<()> {
+    for variable in atom.variables() {
+        if !seed.contains(variable) {
+            return Err(Error::UngroundedBuiltin {
+                name: format!("!{}", atom.predicate),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn flatten_chunks<T>(chunks: Vec<Vec<T>>) -> Vec<T> {
+    let total_len = chunks.iter().map(Vec::len).sum();
+    let mut values = Vec::with_capacity(total_len);
+    for mut chunk in chunks {
+        values.append(&mut chunk);
+    }
+    values
+}
+
+fn flatten_options<T>(values: Vec<Option<T>>) -> Vec<T> {
+    values.into_iter().flatten().collect()
 }
 
 fn values_are_ordered_compatibly(left: &Value, right: &Value) -> bool {
@@ -710,6 +833,48 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn parallel_in_memory_matches_sequential_for_atoms_negation_and_builtins() -> Result<()> {
+        let persons = (0..3_000)
+            .map(|id| vec![Value::integer(id), Value::string(format!("node-{id}"))])
+            .collect::<Vec<_>>();
+        let banned = (0..3_000)
+            .filter(|id| id % 2 == 0)
+            .map(|id| vec![Value::integer(id)])
+            .collect::<Vec<_>>();
+        let storage = InMemoryStorage::from_facts([
+            ("person".to_string(), persons),
+            ("banned".to_string(), banned),
+        ]);
+        let query = parse_query(r#"person(Id, Name), !banned(Id), contains(Name, "1")"#)?;
+
+        let sequential = Evaluator::evaluate_in_memory(&storage, &query)?;
+        let parallel = Evaluator::evaluate_in_memory_parallel(&storage, &query)?;
+
+        assert!(!parallel.is_empty());
+        assert_eq!(
+            normalize_substitutions(sequential),
+            normalize_substitutions(parallel)
+        );
+        Ok(())
+    }
+
+    fn normalize_substitutions(
+        mut substitutions: Vec<crate::Substitution>,
+    ) -> Vec<Vec<(String, Value)>> {
+        let mut normalized = substitutions
+            .drain(..)
+            .map(|substitution| {
+                substitution
+                    .bindings()
+                    .map(|(name, value)| (name.to_string(), value.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        normalized.sort();
+        normalized
     }
 
     proptest! {

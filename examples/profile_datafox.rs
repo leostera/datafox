@@ -3,17 +3,27 @@ use std::time::Instant;
 use datafox::{Evaluator, InMemoryStorage, Result, Value, parse_query};
 
 fn main() -> Result<()> {
-    let mut edges = Vec::with_capacity(20_000);
-    let mut labels = Vec::with_capacity(20_001);
+    let nodes = std::env::var("DATAFOX_PROFILE_NODES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(20_000);
+    let mut edges = Vec::with_capacity(nodes);
+    let mut labels = Vec::with_capacity(nodes + 1);
 
-    for node in 0..20_000 {
-        edges.push(vec![Value::integer(node), Value::integer(node + 1)]);
+    for node in 0..nodes {
+        edges.push(vec![
+            Value::integer(node as i64),
+            Value::integer((node + 1) as i64),
+        ]);
         labels.push(vec![
-            Value::integer(node),
+            Value::integer(node as i64),
             Value::string(format!("node-{node}")),
         ]);
     }
-    labels.push(vec![Value::integer(20_000), Value::string("node-20000")]);
+    labels.push(vec![
+        Value::integer(nodes as i64),
+        Value::string(format!("node-{nodes}")),
+    ]);
 
     let storage =
         InMemoryStorage::from_facts([("edge".to_string(), edges), ("label".to_string(), labels)]);
@@ -23,16 +33,24 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(200);
+    let mode = std::env::var("DATAFOX_PROFILE_MODE").unwrap_or_else(|_| "serial".to_string());
 
     let start = Instant::now();
     let mut total = 0usize;
     for _ in 0..iterations {
-        total += Evaluator::evaluate_in_memory(&storage, &query)?.len();
+        total += match mode.as_str() {
+            "parallel" => Evaluator::evaluate_in_memory_parallel(&storage, &query)?.len(),
+            "serial" => Evaluator::evaluate_in_memory(&storage, &query)?.len(),
+            other => {
+                eprintln!("unknown DATAFOX_PROFILE_MODE={other:?}; use serial or parallel");
+                std::process::exit(2);
+            }
+        };
     }
 
     let elapsed = start.elapsed();
     println!(
-        "iterations={iterations} total_matches={total} elapsed_ms={:.3}",
+        "mode={mode} nodes={nodes} iterations={iterations} total_matches={total} elapsed_ms={:.3}",
         elapsed.as_secs_f64() * 1_000.0
     );
 
