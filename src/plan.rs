@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
@@ -211,10 +212,7 @@ impl<'a> Planner<'a> {
                 .enumerate()
                 .filter(|(_, clause)| clause.requires.is_subset(&bound))
                 .min_by_key(|(_, clause)| {
-                    (
-                        clause.estimated_rows(context, self.storage, self.prelude, &bound),
-                        clause.original_index,
-                    )
+                    clause.order_key(context, self.storage, self.prelude, &bound)
                 })
             else {
                 return Err(blocked_clause_error(&clauses[0], context));
@@ -287,6 +285,43 @@ struct CandidateClause {
 }
 
 impl CandidateClause {
+    fn order_key(
+        &self,
+        context: &PlanContext,
+        storage: &InMemoryStorage,
+        prelude: &Prelude,
+        bound: &BTreeSet<VariableId>,
+    ) -> (bool, Reverse<usize>, usize, usize) {
+        let bound_variable_count = self.bound_variable_count(bound);
+        let variables = self.variables();
+        let disconnected = !bound.is_empty() && !variables.is_empty() && bound_variable_count == 0;
+
+        (
+            disconnected,
+            Reverse(bound_variable_count),
+            self.estimated_rows(context, storage, prelude, bound),
+            self.original_index,
+        )
+    }
+
+    fn bound_variable_count(&self, bound: &BTreeSet<VariableId>) -> usize {
+        self.variables()
+            .iter()
+            .filter(|variable| bound.contains(variable))
+            .count()
+    }
+
+    fn variables(&self) -> BTreeSet<VariableId> {
+        match &self.clause {
+            PlannedClause::Atom(atom) | PlannedClause::Negated(atom) => atom.variables(),
+            PlannedClause::Relation(relation) => relation
+                .args
+                .iter()
+                .flat_map(PlannedTerm::variables)
+                .collect(),
+        }
+    }
+
     fn estimated_rows(
         &self,
         context: &PlanContext,
@@ -398,5 +433,40 @@ impl PlannedTerm {
             Self::Const(_) | Self::Wildcard => BTreeSet::new(),
             Self::Call { args, .. } => args.iter().flat_map(Self::variables).collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{InMemoryStorage, Planner, Prelude, Result, Value, parse_query};
+
+    use super::PlannedClause;
+
+    #[test]
+    fn planner_prefers_connected_clauses_after_binding_variables() -> Result<()> {
+        let child_facts = (0..100)
+            .map(|index| vec![Value::integer(1), Value::integer(index)])
+            .collect::<Vec<_>>();
+        let storage = InMemoryStorage::from_facts([
+            ("root".to_string(), vec![vec![Value::integer(1)]]),
+            ("child".to_string(), child_facts),
+            ("small".to_string(), vec![vec![Value::integer(9)]]),
+        ]);
+        let prelude = Prelude::new();
+        let query = parse_query("root(A), child(A, B), small(C)")?;
+
+        let plan = Planner::new(&storage, &prelude).plan(&query)?;
+
+        let predicates = plan
+            .clauses
+            .iter()
+            .filter_map(|clause| match clause {
+                PlannedClause::Atom(atom) => Some(plan.predicate_name(atom.predicate)),
+                PlannedClause::Negated(_) | PlannedClause::Relation(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(predicates, vec!["root", "child", "small"]);
+        Ok(())
     }
 }
