@@ -171,13 +171,22 @@ fn lex(source: &str) -> Result<Vec<Token>> {
                 let mut value = String::new();
                 let mut closed = false;
 
-                for (index, next) in chars.by_ref() {
+                while let Some((index, next)) = chars.next() {
                     end = index + next.len_utf8();
-                    if next == '"' {
+                    if next == '\\' {
+                        if let Some((quote_index, '"')) = chars.peek().copied() {
+                            chars.next();
+                            end = quote_index + '"'.len_utf8();
+                            value.push('"');
+                        } else {
+                            value.push(next);
+                        }
+                    } else if next == '"' {
                         closed = true;
                         break;
+                    } else {
+                        value.push(next);
                     }
-                    value.push(next);
                 }
 
                 if !closed {
@@ -744,6 +753,44 @@ mod tests {
         assert_eq!(queries.len(), 2);
         assert!(matches!(&queries[0], Query::Single(_)));
         assert!(matches!(&queries[1], Query::Single(_)));
+    }
+
+    #[test]
+    fn parses_escaped_string_literals() {
+        let query = parse_query(r#"text(Node, "quote: \"")"#).expect("query");
+
+        assert_eq!(
+            query,
+            Query::single(
+                Atom::new(
+                    "text",
+                    vec![
+                        Term::variable("Node").expect("variable"),
+                        Term::constant(Value::string("quote: \""))
+                    ],
+                )
+                .expect("atom")
+            )
+        );
+    }
+
+    #[test]
+    fn preserves_unknown_string_escapes_for_regex_patterns() {
+        let query = parse_query(r#"text(Text, "_async\s*\(")"#).expect("query");
+
+        assert_eq!(
+            query,
+            Query::single(
+                Atom::new(
+                    "text",
+                    vec![
+                        Term::variable("Text").expect("variable"),
+                        Term::constant(Value::string(r"_async\s*\("))
+                    ],
+                )
+                .expect("atom")
+            )
+        );
     }
 
     #[test]

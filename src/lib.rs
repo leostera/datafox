@@ -29,6 +29,7 @@
 //! - [`Term`] for variables, constants, and wildcards.
 //! - [`Atom`], [`Clause`], and [`Query`] for query syntax trees.
 //! - [`Diagnostic`] and [`parse_query`] for query parsing with context.
+//! - [`format_query`] and [`format_queries`] for stable, readable query files.
 //! - [`Substitution`] and [`Unifier`] for binding and matching query variables.
 //! - [`DatafoxClient`], [`DatafoxConfig`], [`DatafoxEnvironment`],
 //!   [`PreparedQuery`], [`PreparedQueryStorage`], [`Planner`], [`Plan`], and [`Storage`]
@@ -46,6 +47,7 @@ mod evaluator;
 mod parser;
 mod plan;
 mod prelude;
+mod pretty;
 mod storage;
 mod substitution;
 mod term;
@@ -64,6 +66,7 @@ pub use evaluator::{Evaluation, EvaluationStrategy};
 pub use parser::{parse_queries, parse_query};
 pub use plan::{PREPARED_QUERY_FORMAT_VERSION, Plan, Planner, PreparedQuery};
 pub use prelude::{BinaryOperator, BinaryRelation, OperatorOutcome, Prelude, RelationOutcome};
+pub use pretty::{format_queries, format_query};
 pub use storage::{
     FactEstimate, FactScan, FactStore, FactTuple, InMemoryStorage, Storage, TupleStream,
     matches_pattern,
