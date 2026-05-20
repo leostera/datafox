@@ -31,6 +31,8 @@
 //! - [`Diagnostic`] and [`parse_query`] for query parsing with context.
 //! - [`Substitution`] and [`Unifier`] for binding and matching query variables.
 //! - [`Storage`], [`Universe`], and [`Evaluator`] for snapshot-based query execution.
+//! - [`Prelude`], [`BinaryRelation`], and [`BinaryOperator`] for ambient facts,
+//!   builtin relations, and expression operators.
 //! - [`Error`] and [`Result`] for typed failures.
 //! - [`atom!`], [`var!`], [`lit!`], and [`subst!`] for test and call-site ergonomics.
 
@@ -39,6 +41,7 @@ mod diagnostic;
 pub mod error;
 mod evaluator;
 mod parser;
+mod prelude;
 mod storage;
 mod substitution;
 mod term;
@@ -53,6 +56,7 @@ pub use evaluator::{
     Evaluation, EvaluationStrategy, Evaluator, EvaluatorBuilder, SubstitutionStream,
 };
 pub use parser::{parse_queries, parse_query};
+pub use prelude::{BinaryOperator, BinaryRelation, Prelude};
 pub use storage::{FactTuple, InMemoryStorage, Storage, TupleStream, matches_pattern};
 pub use substitution::Substitution;
 pub use term::Term;

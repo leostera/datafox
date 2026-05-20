@@ -72,6 +72,10 @@ impl Substitution {
                 .cloned()
                 .map(Term::constant)
                 .unwrap_or_else(|| term.clone()),
+            Term::Call { name, args } => Term::Call {
+                name: name.clone(),
+                args: args.iter().map(|arg| self.apply_to_term(arg)).collect(),
+            },
             _ => term.clone(),
         }
     }
@@ -92,7 +96,7 @@ impl Substitution {
             .iter()
             .map(|term| match self.apply_to_term(term) {
                 Term::Const(value) => Some(value),
-                Term::Var(_) | Term::Wildcard => None,
+                Term::Var(_) | Term::Call { .. } | Term::Wildcard => None,
             })
             .collect()
     }

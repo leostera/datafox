@@ -26,6 +26,7 @@ impl Unifier {
                     Some(substitution.clone())
                 }
             }
+            (Term::Call { .. }, _) | (_, Term::Call { .. }) => None,
             (Term::Wildcard, _) | (_, Term::Wildcard) => Some(substitution.clone()),
         }
     }
@@ -76,6 +77,7 @@ impl Unifier {
             match term {
                 Term::Const(expected) if expected != value => return Ok(None),
                 Term::Const(_) | Term::Wildcard => {}
+                Term::Call { .. } => return Ok(None),
                 Term::Var(variable) => match current.lookup(variable) {
                     Some(existing) if existing != value => return Ok(None),
                     Some(_) => {}
@@ -91,6 +93,7 @@ impl Unifier {
         match term {
             Term::Const(value) => Some(value.clone()),
             Term::Var(variable) => substitution.lookup(variable).cloned(),
+            Term::Call { .. } => None,
             Term::Wildcard => None,
         }
     }

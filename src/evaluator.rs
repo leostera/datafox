@@ -1,14 +1,12 @@
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
-use regex::Regex;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::vec::IntoIter;
 use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::{
-    Atom, Clause, Error, InMemoryStorage, Query, Result, Storage, Substitution, Unifier, Universe,
-    Value,
+    Atom, Clause, Error, InMemoryStorage, Prelude, Query, Result, Storage, Substitution, Term,
+    Universe, Value,
 };
 
 pub type SubstitutionStream = mpsc::Receiver<Result<Substitution>>;
@@ -47,6 +45,7 @@ impl Iterator for Evaluation {
 #[derive(Clone)]
 pub struct Evaluator<'store> {
     storage: &'store InMemoryStorage,
+    prelude: Prelude,
     strategy: EvaluationStrategy,
     pool: Option<Arc<ThreadPool>>,
 }
@@ -54,6 +53,7 @@ pub struct Evaluator<'store> {
 /// Builder for configuring an [`Evaluator`].
 pub struct EvaluatorBuilder<'store> {
     storage: Option<&'store InMemoryStorage>,
+    prelude: Prelude,
     strategy: EvaluationStrategy,
     threads: Option<usize>,
 }
@@ -61,6 +61,11 @@ pub struct EvaluatorBuilder<'store> {
 impl<'store> EvaluatorBuilder<'store> {
     pub fn with_store(mut self, storage: &'store InMemoryStorage) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    pub fn with_prelude(mut self, prelude: Prelude) -> Self {
+        self.prelude = prelude;
         self
     }
 
@@ -97,6 +102,7 @@ impl<'store> EvaluatorBuilder<'store> {
         match self.strategy {
             EvaluationStrategy::Serial => Ok(Evaluator {
                 storage,
+                prelude: self.prelude,
                 strategy: self.strategy,
                 pool: None,
             }),
@@ -110,6 +116,7 @@ impl<'store> EvaluatorBuilder<'store> {
                 })?;
                 Ok(Evaluator {
                     storage,
+                    prelude: self.prelude,
                     strategy: self.strategy,
                     pool: Some(Arc::new(pool)),
                 })
@@ -122,6 +129,7 @@ impl Default for EvaluatorBuilder<'_> {
     fn default() -> Self {
         Self {
             storage: None,
+            prelude: Prelude::new(),
             strategy: EvaluationStrategy::Serial,
             threads: None,
         }
@@ -136,8 +144,7 @@ impl<'store> Evaluator<'store> {
     pub fn eval(&self, query: &Query) -> Result<Evaluation> {
         let substitutions = match self.strategy {
             EvaluationStrategy::Serial => {
-                let mut regex_cache = HashMap::new();
-                Self::evaluate_clauses_serial(self.storage, query.clauses(), &mut regex_cache)?
+                Self::evaluate_clauses_serial(self.storage, &self.prelude, query.clauses())?
             }
             EvaluationStrategy::Parallel { seed_threshold } => {
                 let Some(pool) = &self.pool else {
@@ -147,7 +154,12 @@ impl<'store> Evaluator<'store> {
                     });
                 };
                 pool.install(|| {
-                    Self::evaluate_clauses_parallel(self.storage, query.clauses(), seed_threshold)
+                    Self::evaluate_clauses_parallel(
+                        self.storage,
+                        &self.prelude,
+                        query.clauses(),
+                        seed_threshold,
+                    )
                 })?
             }
         };
@@ -216,6 +228,7 @@ impl<'store> Evaluator<'store> {
         S: Storage + Clone + Send + Sync + 'static,
     {
         debug!(clause_count = clauses.len(), "evaluating positive clauses");
+        let prelude = Prelude::new();
         let mut seeds = vec![Substitution::new()];
 
         for clause in clauses {
@@ -232,7 +245,8 @@ impl<'store> Evaluator<'store> {
                             }
                         }
 
-                        let matches = Self::query_atom_matches(universe, &atom, &seed).await?;
+                        let matches =
+                            Self::query_atom_matches(universe, &prelude, &atom, &seed).await?;
                         if matches.is_empty() {
                             next_seeds.push(seed);
                         }
@@ -248,7 +262,7 @@ impl<'store> Evaluator<'store> {
                 Clause::Builtin { name, args } => {
                     let mut next_seeds = Vec::new();
                     for seed in seeds {
-                        if Self::evaluate_builtin_clause(&name, &args, &seed)? {
+                        if Self::evaluate_builtin_clause(&name, &args, &seed, &prelude)? {
                             next_seeds.push(seed);
                         }
                     }
@@ -264,7 +278,8 @@ impl<'store> Evaluator<'store> {
 
             let mut next_seeds = Vec::new();
             for seed in seeds {
-                let mut matches = Self::query_atom_matches(universe, &atom, &seed).await?;
+                let mut matches =
+                    Self::query_atom_matches(universe, &prelude, &atom, &seed).await?;
                 next_seeds.append(&mut matches);
             }
             debug!(seed_count = next_seeds.len(), predicate = %atom.predicate, "advanced clause evaluation");
@@ -276,8 +291,8 @@ impl<'store> Evaluator<'store> {
 
     fn evaluate_clauses_serial(
         storage: &InMemoryStorage,
+        prelude: &Prelude,
         clauses: Vec<Clause>,
-        regex_cache: &mut HashMap<String, Regex>,
     ) -> Result<Vec<Substitution>> {
         let mut seeds = vec![Substitution::new()];
 
@@ -295,7 +310,8 @@ impl<'store> Evaluator<'store> {
                             }
                         }
 
-                        let matches = Self::query_atom_matches_in_memory(storage, &atom, &seed)?;
+                        let matches =
+                            Self::query_atom_matches_in_memory(storage, prelude, &atom, &seed)?;
                         if matches.is_empty() {
                             next_seeds.push(seed);
                         }
@@ -306,7 +322,7 @@ impl<'store> Evaluator<'store> {
                 Clause::Builtin { name, args } => {
                     let mut next_seeds = Vec::new();
                     for seed in seeds {
-                        if Self::evaluate_builtin_clause_cached(&name, &args, &seed, regex_cache)? {
+                        if Self::evaluate_builtin_clause(&name, &args, &seed, prelude)? {
                             next_seeds.push(seed);
                         }
                     }
@@ -317,7 +333,9 @@ impl<'store> Evaluator<'store> {
 
             let mut next_seeds = Vec::new();
             for seed in seeds {
-                next_seeds.extend(Self::query_atom_matches_in_memory(storage, &atom, &seed)?);
+                next_seeds.extend(Self::query_atom_matches_in_memory(
+                    storage, prelude, &atom, &seed,
+                )?);
             }
             seeds = next_seeds;
         }
@@ -327,6 +345,7 @@ impl<'store> Evaluator<'store> {
 
     fn evaluate_clauses_parallel(
         storage: &InMemoryStorage,
+        prelude: &Prelude,
         clauses: Vec<Clause>,
         seed_threshold: usize,
     ) -> Result<Vec<Substitution>> {
@@ -334,12 +353,11 @@ impl<'store> Evaluator<'store> {
 
         for clause in clauses {
             if seeds.len() < seed_threshold {
-                let mut regex_cache = HashMap::new();
-                seeds = Self::advance_clause_in_memory(storage, clause, seeds, &mut regex_cache)?;
+                seeds = Self::advance_clause_in_memory(storage, prelude, clause, seeds)?;
                 continue;
             }
 
-            seeds = Self::advance_clause_in_memory_parallel(storage, clause, seeds)?;
+            seeds = Self::advance_clause_in_memory_parallel(storage, prelude, clause, seeds)?;
         }
 
         Ok(seeds)
@@ -347,9 +365,9 @@ impl<'store> Evaluator<'store> {
 
     fn advance_clause_in_memory(
         storage: &InMemoryStorage,
+        prelude: &Prelude,
         clause: Clause,
         seeds: Vec<Substitution>,
-        regex_cache: &mut HashMap<String, Regex>,
     ) -> Result<Vec<Substitution>> {
         let atom = match clause {
             Clause::Atom(atom) => atom,
@@ -358,7 +376,8 @@ impl<'store> Evaluator<'store> {
                 for seed in seeds {
                     ensure_negation_is_grounded(&atom, &seed)?;
 
-                    let matches = Self::query_atom_matches_in_memory(storage, &atom, &seed)?;
+                    let matches =
+                        Self::query_atom_matches_in_memory(storage, prelude, &atom, &seed)?;
                     if matches.is_empty() {
                         next_seeds.push(seed);
                     }
@@ -368,7 +387,7 @@ impl<'store> Evaluator<'store> {
             Clause::Builtin { name, args } => {
                 let mut next_seeds = Vec::new();
                 for seed in seeds {
-                    if Self::evaluate_builtin_clause_cached(&name, &args, &seed, regex_cache)? {
+                    if Self::evaluate_builtin_clause(&name, &args, &seed, prelude)? {
                         next_seeds.push(seed);
                     }
                 }
@@ -378,20 +397,23 @@ impl<'store> Evaluator<'store> {
 
         let mut next_seeds = Vec::new();
         for seed in seeds {
-            next_seeds.extend(Self::query_atom_matches_in_memory(storage, &atom, &seed)?);
+            next_seeds.extend(Self::query_atom_matches_in_memory(
+                storage, prelude, &atom, &seed,
+            )?);
         }
         Ok(next_seeds)
     }
 
     fn advance_clause_in_memory_parallel(
         storage: &InMemoryStorage,
+        prelude: &Prelude,
         clause: Clause,
         seeds: Vec<Substitution>,
     ) -> Result<Vec<Substitution>> {
         match clause {
             Clause::Atom(atom) => seeds
                 .into_par_iter()
-                .map(|seed| Self::query_atom_matches_in_memory(storage, &atom, &seed))
+                .map(|seed| Self::query_atom_matches_in_memory(storage, prelude, &atom, &seed))
                 .collect::<Result<Vec<_>>>()
                 .map(flatten_chunks),
             Clause::Negated(atom) => seeds
@@ -399,15 +421,16 @@ impl<'store> Evaluator<'store> {
                 .map(|seed| {
                     ensure_negation_is_grounded(&atom, &seed)?;
 
-                    let matches = Self::query_atom_matches_in_memory(storage, &atom, &seed)?;
+                    let matches =
+                        Self::query_atom_matches_in_memory(storage, prelude, &atom, &seed)?;
                     Ok(matches.is_empty().then_some(seed))
                 })
                 .collect::<Result<Vec<_>>>()
                 .map(flatten_options),
             Clause::Builtin { name, args } => seeds
                 .into_par_iter()
-                .map_init(HashMap::new, |regex_cache, seed| {
-                    Self::evaluate_builtin_clause_cached(&name, &args, &seed, regex_cache)
+                .map(|seed| {
+                    Self::evaluate_builtin_clause(&name, &args, &seed, prelude)
                         .map(|keep| keep.then_some(seed))
                 })
                 .collect::<Result<Vec<_>>>()
@@ -417,18 +440,9 @@ impl<'store> Evaluator<'store> {
 
     fn evaluate_builtin_clause(
         name: &str,
-        args: &[crate::Term],
+        args: &[Term],
         seed: &Substitution,
-    ) -> Result<bool> {
-        let mut regex_cache = HashMap::new();
-        Self::evaluate_builtin_clause_cached(name, args, seed, &mut regex_cache)
-    }
-
-    fn evaluate_builtin_clause_cached(
-        name: &str,
-        args: &[crate::Term],
-        seed: &Substitution,
-        regex_cache: &mut HashMap<String, Regex>,
+        prelude: &Prelude,
     ) -> Result<bool> {
         let [left, right] = args else {
             return Err(Error::BuiltinArityMismatch {
@@ -438,72 +452,38 @@ impl<'store> Evaluator<'store> {
             });
         };
 
-        let Some(left) = Unifier::ground_term(seed, left) else {
-            return Err(Error::UngroundedBuiltin {
-                name: name.to_string(),
-            });
-        };
-        let Some(right) = Unifier::ground_term(seed, right) else {
-            return Err(Error::UngroundedBuiltin {
+        let Some(relation) = prelude.relation(name) else {
+            return Err(Error::UnsupportedBuiltin {
                 name: name.to_string(),
             });
         };
 
-        match name {
-            "eq" => Ok(left == right),
-            "gt" => Ok(values_are_ordered_compatibly(&left, &right) && left > right),
-            "gte" => Ok(values_are_ordered_compatibly(&left, &right) && left >= right),
-            "lt" => Ok(values_are_ordered_compatibly(&left, &right) && left < right),
-            "lte" => Ok(values_are_ordered_compatibly(&left, &right) && left <= right),
-            "startsWith" => {
-                let (haystack, prefix) = string_args(name, &left, &right)?;
-                Ok(haystack.starts_with(prefix))
+        let left = evaluate_term(left, seed, prelude)?;
+        let right = evaluate_term(right, seed, prelude)?;
+
+        match (left, right) {
+            (EvaluatedTerm::Value(left), EvaluatedTerm::Value(right)) => {
+                Ok(relation.evaluate(&left, &right))
             }
-            "endsWith" => {
-                let (haystack, suffix) = string_args(name, &left, &right)?;
-                Ok(haystack.ends_with(suffix))
+            (EvaluatedTerm::NoResult, _) | (_, EvaluatedTerm::NoResult) => Ok(false),
+            (EvaluatedTerm::Ungrounded, _) | (_, EvaluatedTerm::Ungrounded) => {
+                Err(Error::UngroundedBuiltin {
+                    name: name.to_string(),
+                })
             }
-            "contains" => {
-                let (haystack, needle) = string_args(name, &left, &right)?;
-                Ok(haystack.contains(needle))
-            }
-            "notStartsWith" => {
-                let (haystack, prefix) = string_args(name, &left, &right)?;
-                Ok(!haystack.starts_with(prefix))
-            }
-            "notEndsWith" => {
-                let (haystack, suffix) = string_args(name, &left, &right)?;
-                Ok(!haystack.ends_with(suffix))
-            }
-            "notContains" => {
-                let (haystack, needle) = string_args(name, &left, &right)?;
-                Ok(!haystack.contains(needle))
-            }
-            "matchesRegex" => {
-                let (haystack, pattern) = string_args(name, &left, &right)?;
-                regex_is_match(name, haystack, pattern, regex_cache)
-            }
-            "notMatchesRegex" => {
-                let (haystack, pattern) = string_args(name, &left, &right)?;
-                Ok(!regex_is_match(name, haystack, pattern, regex_cache)?)
-            }
-            "before" => Ok(values_are_ordered_compatibly(&left, &right) && left < right),
-            "after" => Ok(values_are_ordered_compatibly(&left, &right) && left > right),
-            _ => Err(Error::UnsupportedBuiltin {
-                name: name.to_string(),
-            }),
         }
     }
 
     async fn query_atom_matches<S>(
         universe: &Universe<S>,
+        prelude: &Prelude,
         atom: &Atom,
         seed: &Substitution,
     ) -> Result<Vec<Substitution>>
     where
         S: Storage + Clone + Send + Sync + 'static,
     {
-        let pattern = atom_to_pattern(atom, seed);
+        let pattern = atom_to_pattern(atom, seed, prelude)?;
         let mut tuples = universe
             .get_facts_matching(&atom.predicate, pattern)
             .await?;
@@ -511,7 +491,7 @@ impl<'store> Evaluator<'store> {
 
         while let Some(tuple) = tuples.recv().await {
             let tuple = tuple?;
-            if let Some(substitution) = Unifier::match_atom(seed, atom, &tuple)? {
+            if let Some(substitution) = match_atom(seed, atom, &tuple, prelude)? {
                 substitutions.push(substitution);
             }
         }
@@ -525,14 +505,21 @@ impl<'store> Evaluator<'store> {
 
     fn query_atom_matches_in_memory(
         storage: &InMemoryStorage,
+        prelude: &Prelude,
         atom: &Atom,
         seed: &Substitution,
     ) -> Result<Vec<Substitution>> {
-        let pattern = atom_to_pattern(atom, seed);
+        let pattern = atom_to_pattern(atom, seed, prelude)?;
         let mut substitutions = Vec::new();
 
         for tuple in storage.facts_matching(&atom.predicate, &pattern) {
-            if let Some(substitution) = Unifier::match_atom(seed, atom, tuple)? {
+            if let Some(substitution) = match_atom(seed, atom, tuple, prelude)? {
+                substitutions.push(substitution);
+            }
+        }
+
+        for tuple in prelude.facts().facts_matching(&atom.predicate, &pattern) {
+            if let Some(substitution) = match_atom(seed, atom, tuple, prelude)? {
                 substitutions.push(substitution);
             }
         }
@@ -541,15 +528,101 @@ impl<'store> Evaluator<'store> {
     }
 }
 
-fn atom_to_pattern(atom: &Atom, seed: &Substitution) -> Vec<Option<Value>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EvaluatedTerm {
+    Value(Value),
+    Ungrounded,
+    NoResult,
+}
+
+fn atom_to_pattern(
+    atom: &Atom,
+    seed: &Substitution,
+    prelude: &Prelude,
+) -> Result<Vec<Option<Value>>> {
     atom.args
         .iter()
-        .map(|term| match term {
-            crate::Term::Const(value) => Some(value.clone()),
-            crate::Term::Var(variable) => seed.lookup(variable).cloned(),
-            crate::Term::Wildcard => None,
+        .map(|term| match evaluate_term(term, seed, prelude)? {
+            EvaluatedTerm::Value(value) => Ok(Some(value)),
+            EvaluatedTerm::Ungrounded | EvaluatedTerm::NoResult => Ok(None),
         })
         .collect()
+}
+
+fn match_atom(
+    seed: &Substitution,
+    atom: &Atom,
+    tuple: &[Value],
+    prelude: &Prelude,
+) -> Result<Option<Substitution>> {
+    if atom.args.len() != tuple.len() {
+        return Err(Error::ArityMismatch {
+            predicate: atom.predicate.clone(),
+            expected: atom.args.len(),
+            found: tuple.len(),
+        });
+    }
+
+    let mut current = seed.clone();
+    for (term, value) in atom.args.iter().zip(tuple) {
+        match term {
+            Term::Const(expected) if expected != value => return Ok(None),
+            Term::Const(_) | Term::Wildcard => {}
+            Term::Var(variable) => match current.lookup(variable) {
+                Some(existing) if existing != value => return Ok(None),
+                Some(_) => {}
+                None => current = current.bind(variable.clone(), value.clone()),
+            },
+            Term::Call { .. } => match evaluate_term(term, &current, prelude)? {
+                EvaluatedTerm::Value(expected) if expected != *value => return Ok(None),
+                EvaluatedTerm::Value(_) => {}
+                EvaluatedTerm::Ungrounded | EvaluatedTerm::NoResult => return Ok(None),
+            },
+        }
+    }
+
+    Ok(Some(current))
+}
+
+fn evaluate_term(term: &Term, seed: &Substitution, prelude: &Prelude) -> Result<EvaluatedTerm> {
+    match term {
+        Term::Const(value) => Ok(EvaluatedTerm::Value(value.clone())),
+        Term::Var(variable) => Ok(seed
+            .lookup(variable)
+            .cloned()
+            .map(EvaluatedTerm::Value)
+            .unwrap_or(EvaluatedTerm::Ungrounded)),
+        Term::Wildcard => Ok(EvaluatedTerm::Ungrounded),
+        Term::Call { name, args } => {
+            let [left, right] = args.as_slice() else {
+                return Err(Error::BuiltinArityMismatch {
+                    name: name.clone(),
+                    expected: 2,
+                    found: args.len(),
+                });
+            };
+            let left = evaluate_term(left, seed, prelude)?;
+            let right = evaluate_term(right, seed, prelude)?;
+
+            match (left, right) {
+                (EvaluatedTerm::NoResult, _) | (_, EvaluatedTerm::NoResult) => {
+                    Ok(EvaluatedTerm::NoResult)
+                }
+                (EvaluatedTerm::Ungrounded, _) | (_, EvaluatedTerm::Ungrounded) => {
+                    Ok(EvaluatedTerm::Ungrounded)
+                }
+                (EvaluatedTerm::Value(left), EvaluatedTerm::Value(right)) => {
+                    let Some(operator) = prelude.operator(name) else {
+                        return Err(Error::UnsupportedBuiltin { name: name.clone() });
+                    };
+                    Ok(operator
+                        .evaluate(&left, &right)
+                        .map(EvaluatedTerm::Value)
+                        .unwrap_or(EvaluatedTerm::NoResult))
+                }
+            }
+        }
+    }
 }
 
 fn ensure_negation_is_grounded(atom: &Atom, seed: &Substitution) -> Result<()> {
@@ -577,47 +650,14 @@ fn flatten_options<T>(values: Vec<Option<T>>) -> Vec<T> {
     values.into_iter().flatten().collect()
 }
 
-fn values_are_ordered_compatibly(left: &Value, right: &Value) -> bool {
-    matches!(
-        (left, right),
-        (Value::Integer(_), Value::Integer(_)) | (Value::String(_), Value::String(_))
-    )
-}
-
-fn string_args<'a>(name: &str, left: &'a Value, right: &'a Value) -> Result<(&'a str, &'a str)> {
-    match (left, right) {
-        (Value::String(left), Value::String(right)) => Ok((left, right)),
-        _ => Err(Error::BuiltinTypeMismatch {
-            name: name.to_string(),
-            expected: "two string arguments".to_string(),
-        }),
-    }
-}
-
-fn regex_is_match(
-    name: &str,
-    haystack: &str,
-    pattern: &str,
-    regex_cache: &mut HashMap<String, Regex>,
-) -> Result<bool> {
-    if let Some(regex) = regex_cache.get(pattern) {
-        return Ok(regex.is_match(haystack));
-    }
-
-    let regex = Regex::new(pattern).map_err(|_| Error::BuiltinTypeMismatch {
-        name: name.to_string(),
-        expected: "a valid regex pattern as the second string argument".to_string(),
-    })?;
-    let matches = regex.is_match(haystack);
-    regex_cache.insert(pattern.to_string(), regex);
-    Ok(matches)
-}
-
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
 
-    use crate::{Clause, Evaluator, InMemoryStorage, Query, Result, Universe, Value, parse_query};
+    use crate::{
+        BinaryOperator, Clause, Evaluator, InMemoryStorage, Prelude, Query, Result, Universe,
+        Value, parse_query,
+    };
 
     async fn collect_results(
         mut stream: crate::SubstitutionStream,
@@ -903,6 +943,84 @@ mod tests {
             results[0].lookup("Event"),
             Some(&Value::string("gcal:event:one"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn evaluator_supports_default_arithmetic_operators() -> Result<()> {
+        let storage = InMemoryStorage::from_facts([(
+            "value".to_string(),
+            vec![
+                vec![Value::integer(1)],
+                vec![Value::integer(2)],
+                vec![Value::integer(3)],
+            ],
+        )]);
+        let query = parse_query("value(X), (X + 1) = 4, (X * 2) > 5, (X - 1) = 2, (X / 1) = 3")?;
+
+        let results = Evaluator::builder()
+            .with_store(&storage)
+            .build()?
+            .eval(&query)?
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].lookup("X"), Some(&Value::integer(3)));
+        Ok(())
+    }
+
+    #[test]
+    fn evaluator_can_read_facts_from_the_prelude() -> Result<()> {
+        let storage = InMemoryStorage::from_facts([(
+            "value".to_string(),
+            vec![
+                vec![Value::integer(1)],
+                vec![Value::integer(2)],
+                vec![Value::integer(3)],
+            ],
+        )]);
+        let prelude = Prelude::new().with_fact("threshold", vec![Value::integer(2)]);
+        let query = parse_query("value(X), threshold(T), X > T")?;
+
+        let results = Evaluator::builder()
+            .with_store(&storage)
+            .with_prelude(prelude)
+            .build()?
+            .eval(&query)?
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].lookup("X"), Some(&Value::integer(3)));
+        assert_eq!(results[0].lookup("T"), Some(&Value::integer(2)));
+        Ok(())
+    }
+
+    #[test]
+    fn evaluator_can_use_custom_prelude_operators() -> Result<()> {
+        let storage = InMemoryStorage::from_facts([(
+            "value".to_string(),
+            vec![vec![Value::integer(2)], vec![Value::integer(3)]],
+        )]);
+        let prelude =
+            Prelude::new().with_operator(BinaryOperator::new("plusTen", |left, right| {
+                match (left, right) {
+                    (Value::Integer(left), Value::Integer(right)) => {
+                        Some(Value::integer(left + right + 10))
+                    }
+                    _ => None,
+                }
+            }));
+        let query = parse_query("value(X), (X plusTen 1) = 14")?;
+
+        let results = Evaluator::builder()
+            .with_store(&storage)
+            .with_prelude(prelude)
+            .build()?
+            .eval(&query)?
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].lookup("X"), Some(&Value::integer(3)));
         Ok(())
     }
 

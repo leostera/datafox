@@ -14,6 +14,10 @@ enum TokenKind {
     Equal,
     Comma,
     Semicolon,
+    Plus,
+    Minus,
+    Star,
+    Slash,
     GreaterThan,
     GreaterThanOrEqual,
     LessThan,
@@ -72,6 +76,54 @@ fn lex(source: &str) -> Result<Vec<Token>> {
             },
             ';' => Token {
                 kind: TokenKind::Semicolon,
+                span: Span::new(start, start + ch.len_utf8()),
+            },
+            '+' => Token {
+                kind: TokenKind::Plus,
+                span: Span::new(start, start + ch.len_utf8()),
+            },
+            '-' => {
+                if chars.peek().is_some_and(|(_, next)| next.is_ascii_digit()) {
+                    let mut end = start + ch.len_utf8();
+                    let mut text = String::from(ch);
+
+                    while let Some((index, next)) = chars.peek().copied() {
+                        if !next.is_ascii_digit() {
+                            break;
+                        }
+                        chars.next();
+                        text.push(next);
+                        end = index + next.len_utf8();
+                    }
+
+                    match text.parse::<i64>() {
+                        Ok(value) => Token {
+                            kind: TokenKind::Integer(value),
+                            span: Span::new(start, end),
+                        },
+                        Err(_) => {
+                            return Err(Error::Parse {
+                                diagnostics: vec![
+                                    Diagnostic::new("invalid integer literal")
+                                        .with_span(Span::new(start, end))
+                                        .with_found(text),
+                                ],
+                            });
+                        }
+                    }
+                } else {
+                    Token {
+                        kind: TokenKind::Minus,
+                        span: Span::new(start, start + ch.len_utf8()),
+                    }
+                }
+            }
+            '*' => Token {
+                kind: TokenKind::Star,
+                span: Span::new(start, start + ch.len_utf8()),
+            },
+            '/' => Token {
+                kind: TokenKind::Slash,
                 span: Span::new(start, start + ch.len_utf8()),
             },
             '<' => {
@@ -170,7 +222,7 @@ fn lex(source: &str) -> Result<Vec<Token>> {
                     span: Span::new(start, end),
                 }
             }
-            '-' | '0'..='9' => {
+            '0'..='9' => {
                 let mut end = start + ch.len_utf8();
                 let mut text = String::from(ch);
 
@@ -367,11 +419,11 @@ impl<'a> Parser<'a> {
             )],
         })?;
         let name = match operator.kind {
-            TokenKind::GreaterThan => "gt",
-            TokenKind::GreaterThanOrEqual => "gte",
-            TokenKind::LessThan => "lt",
-            TokenKind::LessThanOrEqual => "lte",
-            TokenKind::Equal => "eq",
+            TokenKind::GreaterThan => ">",
+            TokenKind::GreaterThanOrEqual => ">=",
+            TokenKind::LessThan => "<",
+            TokenKind::LessThanOrEqual => "<=",
+            TokenKind::Equal => "=",
             _ => {
                 return Err(Error::Parse {
                     diagnostics: vec![
@@ -430,6 +482,7 @@ impl<'a> Parser<'a> {
                 Ok(Term::constant(Value::string(value)))
             }
             TokenKind::Integer(value) => Ok(Term::constant(Value::integer(value))),
+            TokenKind::LeftParen => self.parse_parenthesized_term(),
             TokenKind::Identifier(value) => {
                 if value
                     .chars()
@@ -449,6 +502,38 @@ impl<'a> Parser<'a> {
                 ],
             }),
         }
+    }
+
+    fn parse_parenthesized_term(&mut self) -> Result<Term> {
+        let left = self.parse_term()?;
+        let operator = self.next().ok_or_else(|| Error::Parse {
+            diagnostics: vec![Diagnostic::new(
+                "expected an operator in parenthesized term, found end of input",
+            )],
+        })?;
+        let name = match operator.kind {
+            TokenKind::Plus => "+",
+            TokenKind::Minus => "-",
+            TokenKind::Star => "*",
+            TokenKind::Slash => "/",
+            TokenKind::Identifier(ref value) | TokenKind::Quoted(ref value) => value.as_str(),
+            _ => {
+                return Err(Error::Parse {
+                    diagnostics: vec![
+                        Diagnostic::new("expected an operator in parenthesized term")
+                            .with_span(operator.span)
+                            .with_found(self.token_text(&operator)),
+                    ],
+                });
+            }
+        };
+        let right = self.parse_term()?;
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::RightParen),
+            "expected `)` after parenthesized term",
+        )?;
+
+        Term::call(name, vec![left, right])
     }
 
     fn parse_predicate(&mut self) -> Result<String> {
@@ -527,12 +612,38 @@ impl<'a> Parser<'a> {
                 | TokenKind::Integer(_)
                 | TokenKind::String(_)
                 | TokenKind::Quoted(_)
+                | TokenKind::LeftParen
                 | TokenKind::Underscore
         ) {
             return false;
         }
 
-        self.peek_n(1).is_some_and(|token| {
+        let operator_offset = if matches!(left.kind, TokenKind::LeftParen) {
+            let mut depth = 0usize;
+            let mut offset = 0usize;
+            loop {
+                let Some(token) = self.peek_n(offset) else {
+                    return false;
+                };
+
+                match token.kind {
+                    TokenKind::LeftParen => depth += 1,
+                    TokenKind::RightParen => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break offset + 1;
+                        }
+                    }
+                    _ => {}
+                }
+
+                offset += 1;
+            }
+        } else {
+            1
+        };
+
+        self.peek_n(operator_offset).is_some_and(|token| {
             matches!(
                 token.kind,
                 TokenKind::GreaterThan
@@ -688,14 +799,14 @@ mod tests {
                     .expect("atom"),
                 ),
                 Clause::builtin(
-                    "lt",
+                    "<",
                     vec![
                         Term::variable("Start").expect("variable"),
                         Term::constant(Value::string("2026-01-01 21:12:00")),
                     ],
                 ),
                 Clause::builtin(
-                    "gt",
+                    ">",
                     vec![
                         Term::variable("Start").expect("variable"),
                         Term::constant(Value::string("2026-01-02")),
@@ -714,24 +825,82 @@ mod tests {
             query,
             Query::multi(vec![
                 Clause::builtin(
-                    "lte",
+                    "<=",
                     vec![
                         Term::variable("A").expect("variable"),
                         Term::variable("B").expect("variable"),
                     ],
                 ),
                 Clause::builtin(
-                    "gte",
+                    ">=",
                     vec![
                         Term::variable("B").expect("variable"),
                         Term::variable("C").expect("variable"),
                     ],
                 ),
                 Clause::builtin(
-                    "eq",
+                    "=",
                     vec![
                         Term::variable("C").expect("variable"),
                         Term::variable("D").expect("variable"),
+                    ],
+                ),
+            ])
+            .expect("multi"),
+        );
+    }
+
+    #[test]
+    fn parses_parenthesized_binary_operator_terms() {
+        let query =
+            parse_query("value(X), (X + 1) > 2, (X * 2) = 4, (X custom 3) = 5").expect("query");
+
+        assert_eq!(
+            query,
+            Query::multi(vec![
+                Clause::atom(
+                    Atom::new("value", vec![Term::variable("X").expect("variable")]).expect("atom"),
+                ),
+                Clause::builtin(
+                    ">",
+                    vec![
+                        Term::call(
+                            "+",
+                            vec![
+                                Term::variable("X").expect("variable"),
+                                Term::constant(Value::integer(1)),
+                            ],
+                        )
+                        .expect("call"),
+                        Term::constant(Value::integer(2)),
+                    ],
+                ),
+                Clause::builtin(
+                    "=",
+                    vec![
+                        Term::call(
+                            "*",
+                            vec![
+                                Term::variable("X").expect("variable"),
+                                Term::constant(Value::integer(2)),
+                            ],
+                        )
+                        .expect("call"),
+                        Term::constant(Value::integer(4)),
+                    ],
+                ),
+                Clause::builtin(
+                    "=",
+                    vec![
+                        Term::call(
+                            "custom",
+                            vec![
+                                Term::variable("X").expect("variable"),
+                                Term::constant(Value::integer(3)),
+                            ],
+                        )
+                        .expect("call"),
+                        Term::constant(Value::integer(5)),
                     ],
                 ),
             ])

@@ -44,6 +44,7 @@ fn main() -> datafox::Result<()> {
 | Negation | `node(Node), !test(Node)` |
 | Query set | `node(Node); edge(From, To)` |
 | Quoted predicate | `'local://schema/name'(Entity, Value)` |
+| Binary expression | `(Line + 1) = 42` |
 
 Builtins are available as clauses:
 
@@ -54,6 +55,7 @@ Builtins are available as clauses:
 | Negative string matching | `notContains(Text, "dbg!")` |
 | Regex matching | `matchesRegex(Text, "^dbg!")` |
 | Temporal aliases | `before(Start, End)`, `after(End, Start)` |
+| Arithmetic operators | `(X + 1) = Y`, `(X * 2) > 10`, `(X - 1) = 0`, `(X / 2) = 4` |
 
 Negated atoms and builtin arguments must be grounded by earlier clauses. Evaluation is read-only and snapshot-oriented; facts are supplied by the caller.
 
@@ -70,4 +72,22 @@ let evaluator = Evaluator::builder()
 for substitution in evaluator.eval(&query)? {
     println!("{substitution}");
 }
+```
+
+Add a prelude when the evaluator should see ambient facts, custom relations, or custom expression operators:
+
+```rust
+use datafox::{BinaryOperator, Evaluator, Prelude, Value};
+
+let prelude = Prelude::new()
+    .with_fact("threshold", vec![Value::integer(10)])
+    .with_operator(BinaryOperator::new("plusTen", |left, right| match (left, right) {
+        (Value::Integer(left), Value::Integer(right)) => Some(Value::integer(left + right + 10)),
+        _ => None,
+    }));
+
+let evaluator = Evaluator::builder()
+    .with_store(&storage)
+    .with_prelude(prelude)
+    .build()?;
 ```
