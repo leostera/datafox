@@ -1,16 +1,18 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 use crate::evaluator::Evaluator;
 use crate::{
-    Error, Evaluation, EvaluationStrategy, InMemoryStorage, Plan, Planner, Prelude, PreparedQuery,
-    Query, Result,
+    Error, Evaluation, EvaluationStrategy, InMemoryStorage, PREPARED_QUERY_FORMAT_VERSION, Plan,
+    Planner, Prelude, PreparedQuery, Query, Result,
 };
 
 #[derive(Clone)]
 pub struct DatafoxEnvironment {
     prelude: Prelude,
-    planning_cache: Option<PlanningCache>,
+    prepared_query_storage: Option<Arc<dyn PreparedQueryStorage>>,
 }
 
 impl DatafoxEnvironment {
@@ -23,8 +25,16 @@ impl DatafoxEnvironment {
     }
 
     pub fn prepare(&self, query: &Query) -> Result<Arc<PreparedQuery>> {
-        if let Some(cache) = &self.planning_cache {
-            return cache.prepare(query, &self.prelude);
+        if let Some(storage) = &self.prepared_query_storage {
+            let key = PreparedQueryKey::new(query.clone());
+            if let Some(prepared) = storage.get(&key)? {
+                prepared.validate_for_prelude(&self.prelude)?;
+                return Ok(prepared);
+            }
+
+            let prepared = Arc::new(self.prepare_uncached(query)?);
+            storage.insert(key, Arc::clone(&prepared))?;
+            return Ok(prepared);
         }
 
         Ok(Arc::new(self.prepare_uncached(query)?))
@@ -51,7 +61,7 @@ impl Default for DatafoxEnvironment {
     fn default() -> Self {
         Self {
             prelude: Prelude::new(),
-            planning_cache: None,
+            prepared_query_storage: None,
         }
     }
 }
@@ -67,9 +77,16 @@ impl DatafoxEnvironmentBuilder {
         self
     }
 
-    pub fn with_planning_cache(mut self, planning_cache: PlanningCache) -> Self {
-        self.environment.planning_cache = Some(planning_cache);
+    pub fn with_prepared_query_storage<S>(mut self, storage: S) -> Self
+    where
+        S: PreparedQueryStorage + 'static,
+    {
+        self.environment.prepared_query_storage = Some(Arc::new(storage));
         self
+    }
+
+    pub fn with_planning_cache(self, planning_cache: PlanningCache) -> Self {
+        self.with_prepared_query_storage(planning_cache)
     }
 
     pub fn build(self) -> DatafoxEnvironment {
@@ -77,12 +94,43 @@ impl DatafoxEnvironmentBuilder {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct PlanningCache {
-    inner: Arc<Mutex<BTreeMap<Query, Arc<PreparedQuery>>>>,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PreparedQueryKey {
+    format_version: u32,
+    query: Query,
 }
 
-impl PlanningCache {
+impl PreparedQueryKey {
+    pub fn new(query: Query) -> Self {
+        Self {
+            format_version: PREPARED_QUERY_FORMAT_VERSION,
+            query,
+        }
+    }
+
+    pub fn format_version(&self) -> u32 {
+        self.format_version
+    }
+
+    pub fn query(&self) -> &Query {
+        &self.query
+    }
+}
+
+pub trait PreparedQueryStorage: Send + Sync {
+    fn get(&self, key: &PreparedQueryKey) -> Result<Option<Arc<PreparedQuery>>>;
+
+    fn insert(&self, key: PreparedQueryKey, prepared: Arc<PreparedQuery>) -> Result<()>;
+}
+
+#[derive(Clone, Default)]
+pub struct InMemoryPreparedQueryStorage {
+    inner: Arc<Mutex<BTreeMap<PreparedQueryKey, Arc<PreparedQuery>>>>,
+}
+
+pub type PlanningCache = InMemoryPreparedQueryStorage;
+
+impl InMemoryPreparedQueryStorage {
     pub fn unbounded() -> Self {
         Self::default()
     }
@@ -95,24 +143,25 @@ impl PlanningCache {
         Ok(self.lock()?.is_empty())
     }
 
-    fn prepare(&self, query: &Query, prelude: &Prelude) -> Result<Arc<PreparedQuery>> {
-        if let Some(prepared) = self.lock()?.get(query).cloned() {
-            prepared.validate_prelude(prelude)?;
-            return Ok(prepared);
-        }
+    fn lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, BTreeMap<PreparedQueryKey, Arc<PreparedQuery>>>> {
+        self.inner
+            .lock()
+            .map_err(|error| Error::PreparedQueryStorage {
+                message: format!("prepared query storage lock poisoned: {error}"),
+            })
+    }
+}
 
-        let prepared = Arc::new(Planner::for_prelude(prelude).plan(query)?);
-        let mut cache = self.lock()?;
-        Ok(cache
-            .entry(query.clone())
-            .or_insert_with(|| Arc::clone(&prepared))
-            .clone())
+impl PreparedQueryStorage for InMemoryPreparedQueryStorage {
+    fn get(&self, key: &PreparedQueryKey) -> Result<Option<Arc<PreparedQuery>>> {
+        Ok(self.lock()?.get(key).cloned())
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<Query, Arc<PreparedQuery>>>> {
-        self.inner.lock().map_err(|error| Error::EvaluatorBuild {
-            message: format!("planning cache lock poisoned: {error}"),
-        })
+    fn insert(&self, key: PreparedQueryKey, prepared: Arc<PreparedQuery>) -> Result<()> {
+        self.lock()?.entry(key).or_insert(prepared);
+        Ok(())
     }
 }
 
@@ -143,9 +192,16 @@ impl<'store> DatafoxConfig<'store> {
         self
     }
 
-    pub fn with_planning_cache(mut self, planning_cache: PlanningCache) -> Self {
-        self.environment.planning_cache = Some(planning_cache);
+    pub fn with_prepared_query_storage<S>(mut self, storage: S) -> Self
+    where
+        S: PreparedQueryStorage + 'static,
+    {
+        self.environment.prepared_query_storage = Some(Arc::new(storage));
         self
+    }
+
+    pub fn with_planning_cache(self, planning_cache: PlanningCache) -> Self {
+        self.with_prepared_query_storage(planning_cache)
     }
 
     pub fn serial(mut self) -> Self {
@@ -234,15 +290,15 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        DatafoxClient, DatafoxConfig, DatafoxEnvironment, InMemoryStorage, PlanningCache, Result,
-        Value, parse_query,
+        DatafoxClient, DatafoxConfig, DatafoxEnvironment, InMemoryPreparedQueryStorage,
+        InMemoryStorage, PreparedQueryKey, Result, Value, parse_query,
     };
 
     #[test]
-    fn planning_cache_reuses_prepared_queries() -> Result<()> {
-        let cache = PlanningCache::unbounded();
+    fn prepared_query_storage_reuses_prepared_queries() -> Result<()> {
+        let prepared_query_storage = InMemoryPreparedQueryStorage::unbounded();
         let environment = DatafoxEnvironment::builder()
-            .with_planning_cache(cache.clone())
+            .with_prepared_query_storage(prepared_query_storage.clone())
             .build();
         let query = parse_query("value(X), X > 1")?;
 
@@ -250,7 +306,19 @@ mod tests {
         let second = environment.prepare(&query)?;
 
         assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(cache.len()?, 1);
+        assert_eq!(prepared_query_storage.len()?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_query_keys_are_serializable() -> Result<()> {
+        let query = parse_query("value(X), X > 1")?;
+        let key = PreparedQueryKey::new(query);
+
+        let encoded = serde_json::to_string(&key).expect("encoded key");
+        let decoded: PreparedQueryKey = serde_json::from_str(&encoded).expect("decoded key");
+
+        assert_eq!(decoded, key);
         Ok(())
     }
 
@@ -261,7 +329,7 @@ mod tests {
             vec![vec![Value::integer(1)], vec![Value::integer(2)]],
         )]);
         let environment = DatafoxEnvironment::builder()
-            .with_planning_cache(PlanningCache::unbounded())
+            .with_prepared_query_storage(InMemoryPreparedQueryStorage::unbounded())
             .build();
         let datafox =
             DatafoxClient::new(DatafoxConfig::new(&storage).with_environment(environment))?;

@@ -31,7 +31,7 @@
 //! - [`Diagnostic`] and [`parse_query`] for query parsing with context.
 //! - [`Substitution`] and [`Unifier`] for binding and matching query variables.
 //! - [`DatafoxClient`], [`DatafoxConfig`], [`DatafoxEnvironment`],
-//!   [`PreparedQuery`], [`PlanningCache`], [`Planner`], [`Plan`], and [`Storage`]
+//!   [`PreparedQuery`], [`PreparedQueryStorage`], [`Planner`], [`Plan`], and [`Storage`]
 //!   for snapshot-based query execution.
 //! - [`Prelude`], [`BinaryRelation`], and [`BinaryOperator`] for ambient facts,
 //!   builtin relations, and expression operators.
@@ -55,7 +55,8 @@ mod value;
 
 pub use ast::{Atom, Clause, Query};
 pub use client::{
-    DatafoxClient, DatafoxConfig, DatafoxEnvironment, DatafoxEnvironmentBuilder, PlanningCache,
+    DatafoxClient, DatafoxConfig, DatafoxEnvironment, DatafoxEnvironmentBuilder,
+    InMemoryPreparedQueryStorage, PlanningCache, PreparedQueryKey, PreparedQueryStorage,
 };
 pub use diagnostic::{Diagnostic, Span};
 pub use error::{Error, Result};

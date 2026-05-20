@@ -84,18 +84,23 @@ for substitution in datafox.eval_prepared(&prepared)? {
 Prepared queries are pure data, so they can be serialized and loaded later. The runtime
 binds relation and operator names from the active prelude when evaluation starts.
 
-Use an environment with a planning cache when many clients should share prepared queries:
+Use an environment with prepared query storage when many clients should share prepared
+queries:
 
 ```rust
-use datafox::{DatafoxEnvironment, PlanningCache};
+use datafox::{DatafoxEnvironment, InMemoryPreparedQueryStorage};
 
 let environment = DatafoxEnvironment::builder()
-    .with_planning_cache(PlanningCache::unbounded())
+    .with_prepared_query_storage(InMemoryPreparedQueryStorage::unbounded())
     .build();
 let prepared = environment.prepare(&query)?;
 let datafox = environment.client(DatafoxConfig::new(&storage))?;
 let results = datafox.eval_prepared(&prepared)?.collect::<Vec<_>>();
 ```
+
+Implement `PreparedQueryStorage` to persist prepared plans in another backend. The
+storage key includes the prepared-query format version and the source query, while
+the prepared query remains pure serializable data.
 
 Add a prelude when the evaluator should see ambient facts, custom relations, or custom expression operators:
 

@@ -71,6 +71,26 @@ impl PreparedQuery {
         self.required_operators.iter().map(String::as_str)
     }
 
+    pub fn validate(&self) -> Result<()> {
+        if self.format_version != PREPARED_QUERY_FORMAT_VERSION {
+            return Err(Error::PreparedQueryFormat {
+                expected: PREPARED_QUERY_FORMAT_VERSION,
+                found: self.format_version,
+            });
+        }
+
+        for clause in &self.clauses {
+            validate_clause(clause, self)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_for_prelude(&self, prelude: &Prelude) -> Result<()> {
+        self.validate()?;
+        self.validate_prelude(prelude)
+    }
+
     pub(crate) fn bind<'a>(&'a self, prelude: &Prelude) -> Result<ExecutablePlan<'a>> {
         self.validate()?;
         self.validate_prelude(prelude)?;
@@ -102,21 +122,6 @@ impl PreparedQuery {
                     name: operator.clone(),
                 });
             }
-        }
-
-        Ok(())
-    }
-
-    fn validate(&self) -> Result<()> {
-        if self.format_version != PREPARED_QUERY_FORMAT_VERSION {
-            return Err(Error::PreparedQueryFormat {
-                expected: PREPARED_QUERY_FORMAT_VERSION,
-                found: self.format_version,
-            });
-        }
-
-        for clause in &self.clauses {
-            validate_clause(clause, self)?;
         }
 
         Ok(())
