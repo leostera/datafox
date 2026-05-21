@@ -68,7 +68,8 @@ pub use plan::{PREPARED_QUERY_FORMAT_VERSION, Plan, Planner, PreparedQuery};
 pub use prelude::{BinaryOperator, BinaryRelation, OperatorOutcome, Prelude, RelationOutcome};
 pub use pretty::{format_queries, format_query};
 pub use storage::{
-    FactEstimate, FactScan, FactStore, FactTuple, InMemoryStorage, Storage, TupleStream,
+    AtomRole, FactEstimate, FactRequest, FactRequestHints, FactRequestMode, FactScan, FactStore,
+    FactTuple, InMemoryStorage, PatternValue, Projection, SnapshotSelector, Storage, TupleStream,
     matches_pattern,
 };
 pub use substitution::Substitution;

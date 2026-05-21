@@ -10,7 +10,8 @@ use crate::plan::{
     ExecutablePlan, PlannedAtom, PlannedClause, PlannedRelation, PlannedTerm, VariableId,
 };
 use crate::{
-    Error, FactStore, OperatorOutcome, Plan, Prelude, Result, Storage, Substitution, Value,
+    AtomRole, Error, FactRequest, FactRequestMode, FactStore, OperatorOutcome, Plan, Prelude,
+    Result, Storage, Substitution, Value,
 };
 
 #[cfg(test)]
@@ -626,6 +627,7 @@ where
                             &executable,
                             atom,
                             &seed,
+                            AtomRole::Positive,
                         )
                         .await?,
                     );
@@ -639,6 +641,7 @@ where
                         &executable,
                         atom,
                         &seed,
+                        AtomRole::Negated,
                     )
                     .await?;
                     if matches.is_empty() {
@@ -670,16 +673,22 @@ async fn query_streaming_planned_atom_matches<S>(
     plan: &ExecutablePlan<'_>,
     atom: &PlannedAtom,
     seed: &PlanSeed,
+    role: AtomRole,
 ) -> Result<Vec<PlanSeed>>
 where
     S: Storage + ?Sized,
 {
     let predicate = plan.predicate_name(atom.predicate);
     let pattern = planned_atom_to_pattern(atom, seed, plan)?;
+    let request = FactRequest::matching(predicate, pattern.clone())
+        .with_role(role)
+        .with_equality_groups(planned_atom_equality_groups(atom))
+        .with_mode(match role {
+            AtomRole::Positive => FactRequestMode::Tuples,
+            AtomRole::Negated => FactRequestMode::Exists,
+        });
     let mut substitutions = Vec::new();
-    let mut tuples = storage
-        .get_facts_matching(predicate, pattern.clone())
-        .await?;
+    let mut tuples = storage.get_facts(request).await?;
 
     while let Some(tuple) = tuples.recv().await {
         let tuple = tuple?;
@@ -702,6 +711,36 @@ enum EvaluatedTerm {
     Value(Value),
     Ungrounded,
     NoResult,
+}
+
+fn planned_atom_equality_groups(atom: &PlannedAtom) -> Vec<Vec<usize>> {
+    let mut groups = Vec::new();
+    for (index, term) in atom.args.iter().enumerate() {
+        let PlannedTerm::Var(variable) = term else {
+            continue;
+        };
+
+        if atom.args[..index]
+            .iter()
+            .any(|term| matches!(term, PlannedTerm::Var(other) if other == variable))
+        {
+            continue;
+        }
+
+        let group = atom
+            .args
+            .iter()
+            .enumerate()
+            .filter_map(|(candidate_index, term)| {
+                matches!(term, PlannedTerm::Var(other) if other == variable)
+                    .then_some(candidate_index)
+            })
+            .collect::<Vec<_>>();
+        if group.len() > 1 {
+            groups.push(group);
+        }
+    }
+    groups
 }
 
 fn planned_atom_to_pattern(

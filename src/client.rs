@@ -313,15 +313,15 @@ impl<'store, S: ?Sized> DatafoxClient<'store, S> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use tokio::sync::mpsc;
 
     use crate::{
-        DatafoxClient, DatafoxConfig, DatafoxEnvironment, FactTuple, InMemoryPreparedQueryStorage,
-        InMemoryStorage, PreparedQueryKey, Result, Storage, TupleStream, Value, matches_pattern,
-        parse_query,
+        DatafoxClient, DatafoxConfig, DatafoxEnvironment, FactRequest, FactTuple,
+        InMemoryPreparedQueryStorage, InMemoryStorage, PreparedQueryKey, Result, Storage,
+        TupleStream, Value, matches_pattern, parse_query,
     };
 
     #[test]
@@ -376,17 +376,19 @@ mod tests {
     #[derive(Clone)]
     struct StreamingOnlyStorage {
         facts: Vec<FactTuple>,
+        requests: Arc<Mutex<Vec<FactRequest>>>,
     }
 
     #[async_trait]
     impl Storage for StreamingOnlyStorage {
-        async fn get_facts_matching(
-            &self,
-            predicate: &str,
-            pattern: Vec<Option<Value>>,
-        ) -> Result<TupleStream> {
+        async fn get_facts(&self, request: FactRequest) -> Result<TupleStream> {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .push(request.clone());
+            let pattern = request.pattern_options();
             let (tx, rx) = mpsc::channel(4);
-            if predicate == "value" {
+            if request.predicate == "value" {
                 for tuple in &self.facts {
                     if matches_pattern(&pattern, tuple) {
                         tx.send(Ok(tuple.clone())).await.expect("receiver is open");
@@ -399,8 +401,10 @@ mod tests {
 
     #[tokio::test]
     async fn eval_streaming_uses_storage_trait_without_fact_store() -> Result<()> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let storage = StreamingOnlyStorage {
             facts: vec![vec![Value::integer(1)], vec![Value::integer(2)]],
+            requests: Arc::clone(&requests),
         };
         let datafox = DatafoxClient::new(DatafoxConfig::new(&storage))?;
         let query = parse_query("value(X), X > 1")?;
@@ -409,6 +413,11 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].lookup("X"), Some(&Value::integer(2)));
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].predicate, "value");
+        assert_eq!(requests[0].pattern_options(), vec![None]);
+        assert_eq!(requests[0].hints.role, crate::AtomRole::Positive);
         Ok(())
     }
 }

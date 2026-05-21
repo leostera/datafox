@@ -13,14 +13,130 @@ pub type TupleStream = mpsc::Receiver<Result<FactTuple>>;
 
 const DEFAULT_STREAM_BUFFER: usize = 64;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactRequest {
+    pub predicate: String,
+    pub pattern: Vec<PatternValue>,
+    pub projection: Projection,
+    pub mode: FactRequestMode,
+    pub snapshot: SnapshotSelector,
+    pub hints: FactRequestHints,
+}
+
+impl FactRequest {
+    pub fn matching(predicate: impl Into<String>, pattern: Vec<Option<Value>>) -> Self {
+        Self {
+            predicate: predicate.into(),
+            pattern: pattern.into_iter().map(PatternValue::from).collect(),
+            projection: Projection::All,
+            mode: FactRequestMode::Tuples,
+            snapshot: SnapshotSelector::Active,
+            hints: FactRequestHints::default(),
+        }
+    }
+
+    pub fn pattern_options(&self) -> Vec<Option<Value>> {
+        self.pattern.iter().map(PatternValue::as_option).collect()
+    }
+
+    pub fn with_mode(mut self, mode: FactRequestMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn with_role(mut self, role: AtomRole) -> Self {
+        self.hints.role = role;
+        self
+    }
+
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.hints.limit = Some(limit);
+        self
+    }
+
+    pub fn with_equality_groups(mut self, equality_groups: Vec<Vec<usize>>) -> Self {
+        self.hints.equality_groups = equality_groups;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PatternValue {
+    Any,
+    Exact(Value),
+}
+
+impl PatternValue {
+    pub fn as_option(&self) -> Option<Value> {
+        match self {
+            Self::Any => None,
+            Self::Exact(value) => Some(value.clone()),
+        }
+    }
+}
+
+impl From<Option<Value>> for PatternValue {
+    fn from(value: Option<Value>) -> Self {
+        match value {
+            Some(value) => Self::Exact(value),
+            None => Self::Any,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Projection {
+    All,
+    Columns(Vec<usize>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FactRequestMode {
+    Tuples,
+    Exists,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SnapshotSelector {
+    Active,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FactRequestHints {
+    pub role: AtomRole,
+    pub equality_groups: Vec<Vec<usize>>,
+    pub limit: Option<usize>,
+}
+
+impl Default for FactRequestHints {
+    fn default() -> Self {
+        Self {
+            role: AtomRole::Positive,
+            equality_groups: Vec::new(),
+            limit: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AtomRole {
+    Positive,
+    Negated,
+}
+
 /// Snapshot-oriented read-only storage interface for Datalog queries.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    async fn get_facts(&self, request: FactRequest) -> Result<TupleStream>;
+
     async fn get_facts_matching(
         &self,
         predicate: &str,
         pattern: Vec<Option<Value>>,
-    ) -> Result<TupleStream>;
+    ) -> Result<TupleStream> {
+        self.get_facts(FactRequest::matching(predicate, pattern))
+            .await
+    }
 }
 
 #[async_trait]
@@ -28,12 +144,8 @@ impl<T> Storage for &T
 where
     T: Storage + ?Sized,
 {
-    async fn get_facts_matching(
-        &self,
-        predicate: &str,
-        pattern: Vec<Option<Value>>,
-    ) -> Result<TupleStream> {
-        (**self).get_facts_matching(predicate, pattern).await
+    async fn get_facts(&self, request: FactRequest) -> Result<TupleStream> {
+        (**self).get_facts(request).await
     }
 }
 
@@ -239,14 +351,15 @@ fn best_index<'a>(
 
 #[async_trait]
 impl Storage for InMemoryStorage {
-    async fn get_facts_matching(
-        &self,
-        predicate: &str,
-        pattern: Vec<Option<Value>>,
-    ) -> Result<TupleStream> {
+    async fn get_facts(&self, request: FactRequest) -> Result<TupleStream> {
+        let pattern = request.pattern_options();
+        let limit = match request.mode {
+            FactRequestMode::Tuples => request.hints.limit,
+            FactRequestMode::Exists => Some(request.hints.limit.unwrap_or(1)),
+        };
         let tuples = self
-            .facts_matching(predicate, &pattern)
-            .into_iter()
+            .scan(&request.predicate, &pattern)
+            .take(limit.unwrap_or(usize::MAX))
             .cloned()
             .map(Ok)
             .collect::<Vec<_>>();
