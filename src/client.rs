@@ -3,13 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::evaluator::{eval_plan_streaming, Evaluator};
+use crate::evaluator::{Evaluator, eval_plan_streaming};
 use crate::{
     Error, Evaluation, EvaluationStrategy, FactStore, PREPARED_QUERY_FORMAT_VERSION, Plan, Planner,
     Prelude, PreparedQuery, Query, Result, Storage,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct DatafoxEnvironment {
     prelude: Prelude,
     prepared_query_storage: Option<Arc<dyn PreparedQueryStorage>>,
@@ -54,15 +54,6 @@ impl DatafoxEnvironment {
 
     fn prepare_uncached(&self, query: &Query) -> Result<PreparedQuery> {
         Planner::for_prelude(&self.prelude).plan(query)
-    }
-}
-
-impl Default for DatafoxEnvironment {
-    fn default() -> Self {
-        Self {
-            prelude: Prelude::new(),
-            prepared_query_storage: None,
-        }
     }
 }
 

@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Atom, BinaryOperator, BinaryRelation, Clause, Error, FactStore, Prelude,
-    Query, Result, Term, Value,
+    Atom, BinaryOperator, BinaryRelation, Clause, Error, FactStore, Prelude, Query, Result, Term,
+    Value,
 };
 
 pub const PREPARED_QUERY_FORMAT_VERSION: u32 = 1;

@@ -9,7 +9,9 @@ use tracing::debug;
 use crate::plan::{
     ExecutablePlan, PlannedAtom, PlannedClause, PlannedRelation, PlannedTerm, VariableId,
 };
-use crate::{Error, FactStore, OperatorOutcome, Plan, Prelude, Result, Storage, Substitution, Value};
+use crate::{
+    Error, FactStore, OperatorOutcome, Plan, Prelude, Result, Storage, Substitution, Value,
+};
 
 #[cfg(test)]
 use crate::{Atom, Clause, Query, Term, Universe};
@@ -618,8 +620,14 @@ where
             PlannedClause::Atom(atom) => {
                 for seed in seeds {
                     next_seeds.extend(
-                        query_streaming_planned_atom_matches(storage, prelude, &executable, atom, &seed)
-                            .await?,
+                        query_streaming_planned_atom_matches(
+                            storage,
+                            prelude,
+                            &executable,
+                            atom,
+                            &seed,
+                        )
+                        .await?,
                     );
                 }
             }
@@ -669,7 +677,9 @@ where
     let predicate = plan.predicate_name(atom.predicate);
     let pattern = planned_atom_to_pattern(atom, seed, plan)?;
     let mut substitutions = Vec::new();
-    let mut tuples = storage.get_facts_matching(predicate, pattern.clone()).await?;
+    let mut tuples = storage
+        .get_facts_matching(predicate, pattern.clone())
+        .await?;
 
     while let Some(tuple) = tuples.recv().await {
         let tuple = tuple?;
@@ -958,7 +968,8 @@ mod tests {
             vec![crate::var!("Album"), crate::lit!(Value::from("2112"))]
         );
 
-        let results = collect_results(Evaluator::<InMemoryStorage>::query(&universe, &atom).await?).await?;
+        let results =
+            collect_results(Evaluator::<InMemoryStorage>::query(&universe, &atom).await?).await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -976,7 +987,9 @@ mod tests {
         )]));
         let query = parse_query("edge(X, 2)")?;
 
-        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
+        let results =
+            collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?)
+                .await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].lookup("X"), Some(&Value::integer(1)));
@@ -1018,7 +1031,9 @@ mod tests {
             )),
         ])?;
 
-        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
+        let results =
+            collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?)
+                .await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -1052,7 +1067,9 @@ mod tests {
             )),
         ])?;
 
-        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
+        let results =
+            collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?)
+                .await?;
 
         assert!(results.is_empty());
         Ok(())
@@ -1069,7 +1086,9 @@ mod tests {
         ]));
         let query = parse_query(r#"person(Name), !bassist(Name)"#)?;
 
-        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
+        let results =
+            collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?)
+                .await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].lookup("Name"), Some(&Value::string("alex")));
@@ -1120,7 +1139,9 @@ mod tests {
             "gcal:startedAt(Event, Start), Start > \"2026-01-01\", Start < \"2026-01-02\"",
         )?;
 
-        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
+        let results =
+            collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?)
+                .await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -1141,7 +1162,9 @@ mod tests {
         )]));
         let query = parse_query("edge(X, Y), X = Y")?;
 
-        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
+        let results =
+            collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?)
+                .await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].lookup("X"), Some(&Value::integer(1)));
@@ -1162,7 +1185,9 @@ mod tests {
             r#"spotify:displayName(Artist, Name), startsWith(Name, "Ru"), endsWith(Name, "sh"), contains(Name, "us"), matchesRegex(Name, "^R.*h$")"#,
         )?;
 
-        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
+        let results =
+            collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?)
+                .await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -1185,7 +1210,9 @@ mod tests {
             r#"displayName(Artist, Name), notStartsWith(Name, "Ru"), notEndsWith(Name, "sh"), notContains(Name, "us"), notMatchesRegex(Name, "^R")"#,
         )?;
 
-        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
+        let results =
+            collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?)
+                .await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].lookup("Artist"), Some(&Value::string("yes")));
@@ -1211,7 +1238,9 @@ mod tests {
             r#"gcal:startedAt(Event, Start), after(Start, "2026-01-01"), before(Start, "2026-01-02")"#,
         )?;
 
-        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
+        let results =
+            collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?)
+                .await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -1414,8 +1443,10 @@ mod tests {
         let planned = DatafoxClient::new(DatafoxConfig::new(&storage))?
             .eval(&query)?
             .collect::<Vec<_>>();
-        let reference =
-            collect_results(Evaluator::<InMemoryStorage>::evaluate(&Universe::new(storage), &query).await?).await?;
+        let reference = collect_results(
+            Evaluator::<InMemoryStorage>::evaluate(&Universe::new(storage), &query).await?,
+        )
+        .await?;
 
         assert_eq!(
             normalize_substitutions(planned),
