@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Atom, BinaryOperator, BinaryRelation, Clause, Error, FactStore, InMemoryStorage, Prelude,
+    Atom, BinaryOperator, BinaryRelation, Clause, Error, FactStore, Prelude,
     Query, Result, Term, Value,
 };
 
@@ -171,22 +171,15 @@ impl ExecutablePlan<'_> {
     }
 }
 
-pub struct Planner<'a> {
-    storage: Option<&'a InMemoryStorage>,
+pub struct Planner<'a, S: FactStore + ?Sized = crate::InMemoryStorage> {
+    storage: Option<&'a S>,
     prelude: &'a Prelude,
 }
 
-impl<'a> Planner<'a> {
-    pub fn new(storage: &'a InMemoryStorage, prelude: &'a Prelude) -> Self {
+impl<'a, S: FactStore + ?Sized> Planner<'a, S> {
+    pub fn new(storage: &'a S, prelude: &'a Prelude) -> Self {
         Self {
             storage: Some(storage),
-            prelude,
-        }
-    }
-
-    pub fn for_prelude(prelude: &'a Prelude) -> Self {
-        Self {
-            storage: None,
             prelude,
         }
     }
@@ -340,6 +333,15 @@ impl<'a> Planner<'a> {
     }
 }
 
+impl<'a> Planner<'a, crate::InMemoryStorage> {
+    pub fn for_prelude(prelude: &'a Prelude) -> Self {
+        Self {
+            storage: None,
+            prelude,
+        }
+    }
+}
+
 #[derive(Default)]
 struct PlanContext {
     variables_by_name: BTreeMap<String, VariableId>,
@@ -403,7 +405,7 @@ impl CandidateClause {
     fn order_key(
         &self,
         context: &PlanContext,
-        storage: Option<&InMemoryStorage>,
+        storage: Option<&(impl FactStore + ?Sized)>,
         prelude: &Prelude,
         bound: &BTreeSet<VariableId>,
     ) -> (bool, Reverse<usize>, usize, usize) {
@@ -440,7 +442,7 @@ impl CandidateClause {
     fn estimated_rows(
         &self,
         context: &PlanContext,
-        storage: Option<&InMemoryStorage>,
+        storage: Option<&(impl FactStore + ?Sized)>,
         prelude: &Prelude,
         bound: &BTreeSet<VariableId>,
     ) -> usize {

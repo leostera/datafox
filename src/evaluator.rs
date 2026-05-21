@@ -9,12 +9,10 @@ use tracing::debug;
 use crate::plan::{
     ExecutablePlan, PlannedAtom, PlannedClause, PlannedRelation, PlannedTerm, VariableId,
 };
-use crate::{
-    Error, FactStore, InMemoryStorage, OperatorOutcome, Plan, Prelude, Result, Substitution, Value,
-};
+use crate::{Error, FactStore, OperatorOutcome, Plan, Prelude, Result, Storage, Substitution, Value};
 
 #[cfg(test)]
-use crate::{Atom, Clause, Query, Storage, Term, Universe};
+use crate::{Atom, Clause, Query, Term, Universe};
 #[cfg(test)]
 pub type SubstitutionStream = mpsc::Receiver<Result<Substitution>>;
 
@@ -101,23 +99,23 @@ impl Iterator for Evaluation {
 
 /// Query evaluator bound to a fact store and runtime strategy.
 #[derive(Clone)]
-pub(crate) struct Evaluator<'store> {
-    storage: &'store InMemoryStorage,
+pub(crate) struct Evaluator<'store, S: FactStore + ?Sized> {
+    storage: &'store S,
     prelude: Prelude,
     strategy: EvaluationStrategy,
     pool: Option<Arc<ThreadPool>>,
 }
 
 /// Builder for configuring an [`Evaluator`].
-pub(crate) struct EvaluatorBuilder<'store> {
-    storage: Option<&'store InMemoryStorage>,
+pub(crate) struct EvaluatorBuilder<'store, S: FactStore + ?Sized> {
+    storage: Option<&'store S>,
     prelude: Prelude,
     strategy: EvaluationStrategy,
     threads: Option<usize>,
 }
 
-impl<'store> EvaluatorBuilder<'store> {
-    pub(crate) fn with_store(mut self, storage: &'store InMemoryStorage) -> Self {
+impl<'store, S: FactStore + ?Sized> EvaluatorBuilder<'store, S> {
+    pub(crate) fn with_store(mut self, storage: &'store S) -> Self {
         self.storage = Some(storage);
         self
     }
@@ -150,7 +148,7 @@ impl<'store> EvaluatorBuilder<'store> {
         self
     }
 
-    pub(crate) fn build(self) -> Result<Evaluator<'store>> {
+    pub(crate) fn build(self) -> Result<Evaluator<'store, S>> {
         let storage = self.storage.ok_or_else(|| Error::EvaluatorBuild {
             message: "missing storage; call `with_store` before `build`".to_string(),
         })?;
@@ -181,7 +179,7 @@ impl<'store> EvaluatorBuilder<'store> {
     }
 }
 
-impl Default for EvaluatorBuilder<'_> {
+impl<S: FactStore + ?Sized> Default for EvaluatorBuilder<'_, S> {
     fn default() -> Self {
         Self {
             storage: None,
@@ -192,13 +190,13 @@ impl Default for EvaluatorBuilder<'_> {
     }
 }
 
-impl<'store> Evaluator<'store> {
-    pub(crate) fn builder() -> EvaluatorBuilder<'store> {
+impl<'store, S: FactStore + ?Sized> Evaluator<'store, S> {
+    pub(crate) fn builder() -> EvaluatorBuilder<'store, S> {
         EvaluatorBuilder::default()
     }
 
     pub(crate) fn new(
-        storage: &'store InMemoryStorage,
+        storage: &'store S,
         prelude: Prelude,
         strategy: EvaluationStrategy,
         threads: Option<usize>,
@@ -247,33 +245,29 @@ impl<'store> Evaluator<'store> {
         Ok(Evaluation::new(substitutions))
     }
 
-    pub(crate) fn strategy(&self) -> EvaluationStrategy {
-        self.strategy
-    }
-
     #[cfg(test)]
-    pub(crate) async fn query<S>(universe: &Universe<S>, atom: &Atom) -> Result<SubstitutionStream>
+    pub(crate) async fn query<T>(universe: &Universe<T>, atom: &Atom) -> Result<SubstitutionStream>
     where
-        S: Storage + Clone + Send + Sync + 'static,
+        T: Storage + Clone + Send + Sync + 'static,
     {
         Self::evaluate_query(universe.clone(), Query::single(atom.clone())).await
     }
 
     #[cfg(test)]
-    pub(crate) async fn evaluate<S>(
-        universe: &Universe<S>,
+    pub(crate) async fn evaluate<T>(
+        universe: &Universe<T>,
         query: &Query,
     ) -> Result<SubstitutionStream>
     where
-        S: Storage + Clone + Send + Sync + 'static,
+        T: Storage + Clone + Send + Sync + 'static,
     {
         Self::evaluate_query(universe.clone(), query.clone()).await
     }
 
     #[cfg(test)]
-    async fn evaluate_query<S>(universe: Universe<S>, query: Query) -> Result<SubstitutionStream>
+    async fn evaluate_query<T>(universe: Universe<T>, query: Query) -> Result<SubstitutionStream>
     where
-        S: Storage + Clone + Send + Sync + 'static,
+        T: Storage + Clone + Send + Sync + 'static,
     {
         match &query {
             Query::Single(_) | Query::Multi(_) => {}
@@ -307,12 +301,12 @@ impl<'store> Evaluator<'store> {
     }
 
     #[cfg(test)]
-    async fn evaluate_positive_clauses<S>(
-        universe: &Universe<S>,
+    async fn evaluate_positive_clauses<T>(
+        universe: &Universe<T>,
         clauses: Vec<Clause>,
     ) -> Result<Vec<Substitution>>
     where
-        S: Storage + Clone + Send + Sync + 'static,
+        T: Storage + Clone + Send + Sync + 'static,
     {
         debug!(clause_count = clauses.len(), "evaluating positive clauses");
         let prelude = Prelude::new();
@@ -377,7 +371,7 @@ impl<'store> Evaluator<'store> {
     }
 
     fn evaluate_plan_serial(
-        storage: &InMemoryStorage,
+        storage: &(impl FactStore + ?Sized),
         prelude: &Prelude,
         plan: &ExecutablePlan<'_>,
     ) -> Result<Vec<PlanSeed>> {
@@ -421,7 +415,7 @@ impl<'store> Evaluator<'store> {
     }
 
     fn evaluate_plan_parallel(
-        storage: &InMemoryStorage,
+        storage: &(impl FactStore + ?Sized),
         prelude: &Prelude,
         plan: &ExecutablePlan<'_>,
         seed_threshold: usize,
@@ -441,7 +435,7 @@ impl<'store> Evaluator<'store> {
     }
 
     fn advance_planned_clause(
-        storage: &InMemoryStorage,
+        storage: &(impl FactStore + ?Sized),
         prelude: &Prelude,
         plan: &ExecutablePlan<'_>,
         clause: &PlannedClause,
@@ -481,7 +475,7 @@ impl<'store> Evaluator<'store> {
     }
 
     fn advance_planned_clause_parallel(
-        storage: &InMemoryStorage,
+        storage: &(impl FactStore + ?Sized),
         prelude: &Prelude,
         plan: &ExecutablePlan<'_>,
         clause: &PlannedClause,
@@ -514,7 +508,7 @@ impl<'store> Evaluator<'store> {
     }
 
     fn query_planned_atom_matches(
-        storage: &InMemoryStorage,
+        storage: &(impl FactStore + ?Sized),
         prelude: &Prelude,
         plan: &ExecutablePlan<'_>,
         atom: &PlannedAtom,
@@ -577,14 +571,14 @@ impl<'store> Evaluator<'store> {
     }
 
     #[cfg(test)]
-    async fn query_atom_matches<S>(
-        universe: &Universe<S>,
+    async fn query_atom_matches<T>(
+        universe: &Universe<T>,
         prelude: &Prelude,
         atom: &Atom,
         seed: &Substitution,
     ) -> Result<Vec<Substitution>>
     where
-        S: Storage + Clone + Send + Sync + 'static,
+        T: Storage + Clone + Send + Sync + 'static,
     {
         let pattern = atom_to_pattern(atom, seed, prelude)?;
         let mut tuples = universe
@@ -605,6 +599,92 @@ impl<'store> Evaluator<'store> {
         );
         Ok(substitutions)
     }
+}
+
+pub(crate) async fn eval_plan_streaming<S>(
+    storage: &S,
+    prelude: &Prelude,
+    plan: &Plan,
+) -> Result<Evaluation>
+where
+    S: Storage + ?Sized,
+{
+    let executable = plan.bind(prelude)?;
+    let mut seeds = vec![PlanSeed::new(executable.variable_count())];
+
+    for clause in executable.clauses() {
+        let mut next_seeds = Vec::new();
+        match clause {
+            PlannedClause::Atom(atom) => {
+                for seed in seeds {
+                    next_seeds.extend(
+                        query_streaming_planned_atom_matches(storage, prelude, &executable, atom, &seed)
+                            .await?,
+                    );
+                }
+            }
+            PlannedClause::Negated(atom) => {
+                for seed in seeds {
+                    let matches = query_streaming_planned_atom_matches(
+                        storage,
+                        prelude,
+                        &executable,
+                        atom,
+                        &seed,
+                    )
+                    .await?;
+                    if matches.is_empty() {
+                        next_seeds.push(seed);
+                    }
+                }
+            }
+            PlannedClause::Relation(relation) => {
+                for seed in seeds {
+                    if evaluate_planned_relation(relation, &seed, &executable)? {
+                        next_seeds.push(seed);
+                    }
+                }
+            }
+        }
+        seeds = next_seeds;
+    }
+
+    let substitutions = seeds
+        .into_iter()
+        .map(|seed| seed.into_substitution(&executable))
+        .collect();
+    Ok(Evaluation::new(substitutions))
+}
+
+async fn query_streaming_planned_atom_matches<S>(
+    storage: &S,
+    prelude: &Prelude,
+    plan: &ExecutablePlan<'_>,
+    atom: &PlannedAtom,
+    seed: &PlanSeed,
+) -> Result<Vec<PlanSeed>>
+where
+    S: Storage + ?Sized,
+{
+    let predicate = plan.predicate_name(atom.predicate);
+    let pattern = planned_atom_to_pattern(atom, seed, plan)?;
+    let mut substitutions = Vec::new();
+    let mut tuples = storage.get_facts_matching(predicate, pattern.clone()).await?;
+
+    while let Some(tuple) = tuples.recv().await {
+        let tuple = tuple?;
+        if let Some(substitution) = match_planned_atom(seed, atom, &tuple, plan)? {
+            substitutions.push(substitution);
+        }
+    }
+
+    for tuple in prelude.facts().scan(predicate, &pattern) {
+        if let Some(substitution) = match_planned_atom(seed, atom, tuple, plan)? {
+            substitutions.push(substitution);
+        }
+    }
+
+    Ok(substitutions)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -878,7 +958,7 @@ mod tests {
             vec![crate::var!("Album"), crate::lit!(Value::from("2112"))]
         );
 
-        let results = collect_results(Evaluator::query(&universe, &atom).await?).await?;
+        let results = collect_results(Evaluator::<InMemoryStorage>::query(&universe, &atom).await?).await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -896,7 +976,7 @@ mod tests {
         )]));
         let query = parse_query("edge(X, 2)")?;
 
-        let results = collect_results(Evaluator::evaluate(&universe, &query).await?).await?;
+        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].lookup("X"), Some(&Value::integer(1)));
@@ -938,7 +1018,7 @@ mod tests {
             )),
         ])?;
 
-        let results = collect_results(Evaluator::evaluate(&universe, &query).await?).await?;
+        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -972,7 +1052,7 @@ mod tests {
             )),
         ])?;
 
-        let results = collect_results(Evaluator::evaluate(&universe, &query).await?).await?;
+        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
 
         assert!(results.is_empty());
         Ok(())
@@ -989,7 +1069,7 @@ mod tests {
         ]));
         let query = parse_query(r#"person(Name), !bassist(Name)"#)?;
 
-        let results = collect_results(Evaluator::evaluate(&universe, &query).await?).await?;
+        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].lookup("Name"), Some(&Value::string("alex")));
@@ -1004,7 +1084,7 @@ mod tests {
             vec![crate::var!("X"), crate::var!("Y")]
         ))])?;
 
-        let error = match Evaluator::evaluate(&universe, &query).await {
+        let error = match Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await {
             Ok(mut stream) => match stream.recv().await {
                 Some(Err(error)) => error,
                 other => panic!("expected ungrounded negation, got {other:?}"),
@@ -1040,7 +1120,7 @@ mod tests {
             "gcal:startedAt(Event, Start), Start > \"2026-01-01\", Start < \"2026-01-02\"",
         )?;
 
-        let results = collect_results(Evaluator::evaluate(&universe, &query).await?).await?;
+        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -1061,7 +1141,7 @@ mod tests {
         )]));
         let query = parse_query("edge(X, Y), X = Y")?;
 
-        let results = collect_results(Evaluator::evaluate(&universe, &query).await?).await?;
+        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].lookup("X"), Some(&Value::integer(1)));
@@ -1082,7 +1162,7 @@ mod tests {
             r#"spotify:displayName(Artist, Name), startsWith(Name, "Ru"), endsWith(Name, "sh"), contains(Name, "us"), matchesRegex(Name, "^R.*h$")"#,
         )?;
 
-        let results = collect_results(Evaluator::evaluate(&universe, &query).await?).await?;
+        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -1105,7 +1185,7 @@ mod tests {
             r#"displayName(Artist, Name), notStartsWith(Name, "Ru"), notEndsWith(Name, "sh"), notContains(Name, "us"), notMatchesRegex(Name, "^R")"#,
         )?;
 
-        let results = collect_results(Evaluator::evaluate(&universe, &query).await?).await?;
+        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].lookup("Artist"), Some(&Value::string("yes")));
@@ -1131,7 +1211,7 @@ mod tests {
             r#"gcal:startedAt(Event, Start), after(Start, "2026-01-01"), before(Start, "2026-01-02")"#,
         )?;
 
-        let results = collect_results(Evaluator::evaluate(&universe, &query).await?).await?;
+        let results = collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?).await?;
 
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -1293,7 +1373,7 @@ mod tests {
             ],
         )])?;
 
-        let error = match Evaluator::evaluate(&universe, &query).await {
+        let error = match Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await {
             Ok(mut stream) => match stream.recv().await {
                 Some(Err(error)) => error,
                 other => panic!("expected ungrounded builtin error, got {other:?}"),
@@ -1335,7 +1415,7 @@ mod tests {
             .eval(&query)?
             .collect::<Vec<_>>();
         let reference =
-            collect_results(Evaluator::evaluate(&Universe::new(storage), &query).await?).await?;
+            collect_results(Evaluator::<InMemoryStorage>::evaluate(&Universe::new(storage), &query).await?).await?;
 
         assert_eq!(
             normalize_substitutions(planned),
@@ -1355,7 +1435,7 @@ mod tests {
             ],
         )])?;
 
-        let error = match Evaluator::evaluate(&universe, &query).await {
+        let error = match Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await {
             Ok(mut stream) => match stream.recv().await {
                 Some(Err(error)) => error,
                 other => panic!("expected unsupported builtin error, got {other:?}"),

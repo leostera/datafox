@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::evaluator::Evaluator;
+use crate::evaluator::{eval_plan_streaming, Evaluator};
 use crate::{
-    Error, Evaluation, EvaluationStrategy, InMemoryStorage, PREPARED_QUERY_FORMAT_VERSION, Plan,
-    Planner, Prelude, PreparedQuery, Query, Result,
+    Error, Evaluation, EvaluationStrategy, FactStore, PREPARED_QUERY_FORMAT_VERSION, Plan, Planner,
+    Prelude, PreparedQuery, Query, Result, Storage,
 };
 
 #[derive(Clone)]
@@ -40,10 +40,10 @@ impl DatafoxEnvironment {
         Ok(Arc::new(self.prepare_uncached(query)?))
     }
 
-    pub fn client<'store>(
+    pub fn client<'store, S: ?Sized>(
         &self,
-        mut config: DatafoxConfig<'store>,
-    ) -> Result<DatafoxClient<'store>> {
+        mut config: DatafoxConfig<'store, S>,
+    ) -> Result<DatafoxClient<'store, S>> {
         config.environment = self.clone();
         DatafoxClient::new(config)
     }
@@ -165,15 +165,15 @@ impl PreparedQueryStorage for InMemoryPreparedQueryStorage {
     }
 }
 
-pub struct DatafoxConfig<'store> {
-    storage: &'store InMemoryStorage,
+pub struct DatafoxConfig<'store, S: ?Sized = crate::InMemoryStorage> {
+    storage: &'store S,
     environment: DatafoxEnvironment,
     strategy: EvaluationStrategy,
     threads: Option<usize>,
 }
 
-impl<'store> DatafoxConfig<'store> {
-    pub fn new(storage: &'store InMemoryStorage) -> Self {
+impl<'store, S: ?Sized> DatafoxConfig<'store, S> {
+    pub fn new(storage: &'store S) -> Self {
         Self {
             storage,
             environment: DatafoxEnvironment::new(),
@@ -192,9 +192,9 @@ impl<'store> DatafoxConfig<'store> {
         self
     }
 
-    pub fn with_prepared_query_storage<S>(mut self, storage: S) -> Self
+    pub fn with_prepared_query_storage<P>(mut self, storage: P) -> Self
     where
-        S: PreparedQueryStorage + 'static,
+        P: PreparedQueryStorage + 'static,
     {
         self.environment.prepared_query_storage = Some(Arc::new(storage));
         self
@@ -225,33 +225,31 @@ impl<'store> DatafoxConfig<'store> {
     }
 }
 
-pub struct DatafoxClient<'store> {
-    storage: &'store InMemoryStorage,
+pub struct DatafoxClient<'store, S: ?Sized = crate::InMemoryStorage> {
+    storage: &'store S,
     environment: DatafoxEnvironment,
-    evaluator: Evaluator<'store>,
+    strategy: EvaluationStrategy,
+    threads: Option<usize>,
 }
 
-impl<'store> DatafoxClient<'store> {
-    pub fn new(config: DatafoxConfig<'store>) -> Result<Self> {
-        let evaluator = Evaluator::new(
-            config.storage,
-            config.environment.prelude.clone(),
-            config.strategy,
-            config.threads,
-        )?;
-
+impl<'store, S: ?Sized> DatafoxClient<'store, S> {
+    pub fn new(config: DatafoxConfig<'store, S>) -> Result<Self> {
         Ok(Self {
             storage: config.storage,
             environment: config.environment,
-            evaluator,
+            strategy: config.strategy,
+            threads: config.threads,
         })
     }
 
-    pub fn from_store(storage: &'store InMemoryStorage) -> Result<Self> {
+    pub fn from_store(storage: &'store S) -> Result<Self> {
         Self::new(DatafoxConfig::new(storage))
     }
 
-    pub fn planner(&self) -> Planner<'_> {
+    pub fn planner(&self) -> Planner<'_, S>
+    where
+        S: FactStore,
+    {
         Planner::new(self.storage, &self.environment.prelude)
     }
 
@@ -263,17 +261,54 @@ impl<'store> DatafoxClient<'store> {
         Ok((*self.prepare(query)?).clone())
     }
 
-    pub fn eval(&self, query: &Query) -> Result<Evaluation> {
+    pub fn eval(&self, query: &Query) -> Result<Evaluation>
+    where
+        S: FactStore,
+    {
         let prepared = self.prepare(query)?;
         self.eval_prepared(&prepared)
     }
 
-    pub fn eval_prepared(&self, prepared: &PreparedQuery) -> Result<Evaluation> {
-        self.evaluator.eval_plan(prepared)
+    pub fn eval_prepared(&self, prepared: &PreparedQuery) -> Result<Evaluation>
+    where
+        S: FactStore,
+    {
+        Evaluator::new(
+            self.storage,
+            self.environment.prelude.clone(),
+            self.strategy,
+            self.threads,
+        )?
+        .eval_plan(prepared)
     }
 
-    pub fn eval_plan(&self, plan: &Plan) -> Result<Evaluation> {
+    pub fn eval_plan(&self, plan: &Plan) -> Result<Evaluation>
+    where
+        S: FactStore,
+    {
         self.eval_prepared(plan)
+    }
+
+    pub async fn eval_streaming(&self, query: &Query) -> Result<Evaluation>
+    where
+        S: Storage,
+    {
+        let prepared = self.prepare(query)?;
+        self.eval_prepared_streaming(&prepared).await
+    }
+
+    pub async fn eval_prepared_streaming(&self, prepared: &PreparedQuery) -> Result<Evaluation>
+    where
+        S: Storage,
+    {
+        eval_plan_streaming(self.storage, &self.environment.prelude, prepared).await
+    }
+
+    pub async fn eval_plan_streaming(&self, plan: &Plan) -> Result<Evaluation>
+    where
+        S: Storage,
+    {
+        self.eval_prepared_streaming(plan).await
     }
 
     pub fn environment(&self) -> &DatafoxEnvironment {
@@ -281,7 +316,7 @@ impl<'store> DatafoxClient<'store> {
     }
 
     pub fn strategy(&self) -> EvaluationStrategy {
-        self.evaluator.strategy()
+        self.strategy
     }
 }
 
@@ -289,9 +324,13 @@ impl<'store> DatafoxClient<'store> {
 mod tests {
     use std::sync::Arc;
 
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
+
     use crate::{
-        DatafoxClient, DatafoxConfig, DatafoxEnvironment, InMemoryPreparedQueryStorage,
-        InMemoryStorage, PreparedQueryKey, Result, Value, parse_query,
+        DatafoxClient, DatafoxConfig, DatafoxEnvironment, FactTuple, InMemoryPreparedQueryStorage,
+        InMemoryStorage, PreparedQueryKey, Result, Storage, TupleStream, Value, matches_pattern,
+        parse_query,
     };
 
     #[test]
@@ -340,6 +379,45 @@ mod tests {
         let prepared = datafox.eval_prepared(&prepared)?.collect::<Vec<_>>();
 
         assert_eq!(direct, prepared);
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct StreamingOnlyStorage {
+        facts: Vec<FactTuple>,
+    }
+
+    #[async_trait]
+    impl Storage for StreamingOnlyStorage {
+        async fn get_facts_matching(
+            &self,
+            predicate: &str,
+            pattern: Vec<Option<Value>>,
+        ) -> Result<TupleStream> {
+            let (tx, rx) = mpsc::channel(4);
+            if predicate == "value" {
+                for tuple in &self.facts {
+                    if matches_pattern(&pattern, tuple) {
+                        tx.send(Ok(tuple.clone())).await.expect("receiver is open");
+                    }
+                }
+            }
+            Ok(rx)
+        }
+    }
+
+    #[tokio::test]
+    async fn eval_streaming_uses_storage_trait_without_fact_store() -> Result<()> {
+        let storage = StreamingOnlyStorage {
+            facts: vec![vec![Value::integer(1)], vec![Value::integer(2)]],
+        };
+        let datafox = DatafoxClient::new(DatafoxConfig::new(&storage))?;
+        let query = parse_query("value(X), X > 1")?;
+
+        let results = datafox.eval_streaming(&query).await?.collect::<Vec<_>>();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].lookup("X"), Some(&Value::integer(2)));
         Ok(())
     }
 }

@@ -15,12 +15,26 @@ const DEFAULT_STREAM_BUFFER: usize = 64;
 
 /// Snapshot-oriented read-only storage interface for Datalog queries.
 #[async_trait]
-pub trait Storage {
+pub trait Storage: Send + Sync {
     async fn get_facts_matching(
         &self,
         predicate: &str,
         pattern: Vec<Option<Value>>,
     ) -> Result<TupleStream>;
+}
+
+#[async_trait]
+impl<T> Storage for &T
+where
+    T: Storage + ?Sized,
+{
+    async fn get_facts_matching(
+        &self,
+        predicate: &str,
+        pattern: Vec<Option<Value>>,
+    ) -> Result<TupleStream> {
+        (**self).get_facts_matching(predicate, pattern).await
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +53,7 @@ impl FactEstimate {
     }
 }
 
-pub trait FactStore {
+pub trait FactStore: Send + Sync {
     type Scan<'store, 'pattern>: Iterator<Item = &'store FactTuple>
     where
         Self: 'store;
@@ -135,6 +149,28 @@ impl<'store> Iterator for FactScan<'store, '_> {
                     .filter(|tuple| matches_pattern(pattern, tuple))
             }),
         }
+    }
+}
+
+impl<T> FactStore for &T
+where
+    T: FactStore + ?Sized,
+{
+    type Scan<'store, 'pattern>
+        = T::Scan<'store, 'pattern>
+    where
+        Self: 'store;
+
+    fn scan<'store, 'pattern>(
+        &'store self,
+        predicate: &str,
+        pattern: &'pattern [Option<Value>],
+    ) -> Self::Scan<'store, 'pattern> {
+        (**self).scan(predicate, pattern)
+    }
+
+    fn estimate(&self, predicate: &str, pattern: &[Option<Value>]) -> FactEstimate {
+        (**self).estimate(predicate, pattern)
     }
 }
 
