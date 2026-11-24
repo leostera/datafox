@@ -264,6 +264,27 @@ impl<'store> Iterator for FactScan<'store, '_> {
     }
 }
 
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn a_bound_value_in_no_tuple_matches_nothing_without_a_scan() {
+        let storage = InMemoryStorage::from_facts([(
+            "edge".to_owned(),
+            vec![
+                vec![Value::integer(1), Value::integer(2)],
+                vec![Value::integer(2), Value::integer(3)],
+            ],
+        )]);
+        let pattern = [Some(Value::integer(9)), None];
+        assert!(matches!(storage.scan("edge", &pattern), FactScan::Empty));
+        assert_eq!(storage.estimate("edge", &pattern), FactEstimate::exact(0));
+        let pattern = [None, Some(Value::integer(3))];
+        assert_eq!(storage.scan("edge", &pattern).count(), 1);
+    }
+}
+
 impl<T> FactStore for &T
 where
     T: FactStore + ?Sized,
@@ -301,19 +322,17 @@ impl FactStore for InMemoryStorage {
             return FactScan::Empty;
         };
 
-        let best_index = best_index(self, predicate, pattern);
-
-        if let Some(tuple_indexes) = best_index {
-            return FactScan::Indexed {
+        match best_index(self, predicate, pattern) {
+            BestIndex::Unbound => FactScan::All {
+                iter: facts.iter(),
+                pattern,
+            },
+            BestIndex::Absent => FactScan::Empty,
+            BestIndex::Tuples(tuple_indexes) => FactScan::Indexed {
                 facts,
                 tuple_indexes: tuple_indexes.iter(),
                 pattern,
-            };
-        }
-
-        FactScan::All {
-            iter: facts.iter(),
-            pattern,
+            },
         }
     }
 
@@ -322,31 +341,44 @@ impl FactStore for InMemoryStorage {
             return FactEstimate::exact(0);
         };
 
-        if let Some(tuple_indexes) = best_index(self, predicate, pattern) {
-            return FactEstimate::upper_bound(tuple_indexes.len());
+        match best_index(self, predicate, pattern) {
+            BestIndex::Unbound => FactEstimate::upper_bound(facts.len()),
+            BestIndex::Absent => FactEstimate::exact(0),
+            BestIndex::Tuples(tuple_indexes) => FactEstimate::upper_bound(tuple_indexes.len()),
         }
-
-        FactEstimate::upper_bound(facts.len())
     }
+}
+
+/// The tuples a pattern can match, by its bound values.
+enum BestIndex<'a> {
+    /// The pattern binds nothing: any tuple can match.
+    Unbound,
+    /// A bound value is in no tuple: none can match.
+    Absent,
+    /// The tuples with the rarest of the bound values.
+    Tuples(&'a Vec<usize>),
 }
 
 fn best_index<'a>(
     storage: &'a InMemoryStorage,
     predicate: &str,
     pattern: &[Option<Value>],
-) -> Option<&'a Vec<usize>> {
-    pattern
-        .iter()
-        .enumerate()
-        .filter_map(|(value_index, value)| {
-            let value = value.as_ref()?;
-            let tuple_indexes = storage
-                .indexes
-                .get(predicate)?
-                .get(&(value_index, value.clone()))?;
-            Some(tuple_indexes)
-        })
-        .min_by_key(|tuple_indexes| tuple_indexes.len())
+) -> BestIndex<'a> {
+    let mut best = BestIndex::Unbound;
+    for (value_index, value) in pattern.iter().enumerate() {
+        let Some(value) = value else { continue };
+        let Some(tuple_indexes) = storage
+            .indexes
+            .get(predicate)
+            .and_then(|indexes| indexes.get(&(value_index, value.clone())))
+        else {
+            return BestIndex::Absent;
+        };
+        if !matches!(best, BestIndex::Tuples(found) if found.len() <= tuple_indexes.len()) {
+            best = BestIndex::Tuples(tuple_indexes);
+        }
+    }
+    best
 }
 
 #[async_trait]
