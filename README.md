@@ -53,7 +53,7 @@ Builtins are available as clauses:
 | --- | --- |
 | Equality and order | `Start < End`, `A = B`, `A != B` |
 | String matching | `startsWith(Name, "lint")` |
-| Negative string matching | `notContains(Text, "dbg!")` |
+| Negative string matching | `notContains(Text, "dbg!")`, `!startsWith(Name, "test")` |
 | Regex matching | `matchesRegex(Text, "^dbg!")` |
 | Temporal aliases | `before(Start, End)`, `after(End, Start)` |
 | Arithmetic operators | `(X + 1) = Y`, `(X * 2) > 10`, `(X - 1) = 0`, `(X / 2) = 4` |

@@ -557,11 +557,21 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_clause(&mut self) -> Result<Clause> {
-        if self
-            .match_kind(|kind| matches!(kind, TokenKind::Bang))
-            .is_some()
-        {
-            return Ok(Clause::negated(self.parse_atom()?));
+        if let Some(bang) = self.match_kind(|kind| matches!(kind, TokenKind::Bang)) {
+            let atom = self.parse_atom()?;
+            if !is_named_builtin(&atom.predicate) {
+                return Ok(Clause::negated(atom));
+            }
+            // `!startsWith(..)` is `notStartsWith(..)`: a builtin's negation is a builtin.
+            return match negated_builtin(&atom.predicate) {
+                Some(name) => Ok(Clause::builtin(name, atom.args)),
+                None => Err(Error::Parse {
+                    diagnostics: vec![
+                        Diagnostic::new(format!("`{}` can't be negated", atom.predicate))
+                            .with_span(bang.span),
+                    ],
+                }),
+            };
         }
 
         if self.is_infix_builtin_start() {
@@ -827,6 +837,21 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// The builtin that holds exactly when the named one doesn't.
+fn negated_builtin(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "startsWith" => "notStartsWith",
+        "endsWith" => "notEndsWith",
+        "contains" => "notContains",
+        "matchesRegex" => "notMatchesRegex",
+        "notStartsWith" => "startsWith",
+        "notEndsWith" => "endsWith",
+        "notContains" => "contains",
+        "notMatchesRegex" => "matchesRegex",
+        _ => return None,
+    })
+}
+
 fn is_named_builtin(name: &str) -> bool {
     matches!(
         name,
@@ -850,6 +875,16 @@ mod tests {
     use crate::{
         Atom, Clause, Diagnostic, Error, Query, Span, Term, Value, parse_queries, parse_query,
     };
+
+    #[test]
+    fn a_negated_string_builtin_is_its_opposite() {
+        let query =
+            parse_query("edge(X, Y), !startsWith(X, \"a\"), !notEndsWith(Y, \"b\")").unwrap();
+        let clauses = query.clauses();
+        assert!(matches!(&clauses[1], Clause::Builtin { name, .. } if name == "notStartsWith"));
+        assert!(matches!(&clauses[2], Clause::Builtin { name, .. } if name == "endsWith"));
+        assert!(parse_query("edge(X, Y), !before(X, Y)").is_err());
+    }
 
     #[test]
     fn parses_single_goal_queries() {
