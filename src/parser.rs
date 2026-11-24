@@ -1,6 +1,7 @@
 use crate::ast::{Atom, Clause, Query};
 use crate::diagnostic::{Diagnostic, Span};
 use crate::error::{Error, Result};
+use crate::program::{Aggregate, Head, HeadTerm, Program, Rule};
 use crate::{Term, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,10 @@ enum TokenKind {
     LessThanOrEqual,
     LeftParen,
     RightParen,
+    /// Ends a fact or a rule.
+    Dot,
+    /// `:-`, between a rule's head and its body.
+    Implies,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +46,18 @@ pub fn parse_query(source: &str) -> Result<Query> {
         cursor: 0,
     };
     parser.parse_query()
+}
+
+/// Parses a program: facts (`edge(1, 2).`) and rules (`path(X, Y) :- edge(X, Y).`), then
+/// any number of queries separated by `;`, as [`parse_queries`] reads them.
+pub fn parse_program(source: &str) -> Result<Program> {
+    let tokens = lex(source)?;
+    let mut parser = Parser {
+        source,
+        tokens,
+        cursor: 0,
+    };
+    parser.parse_program()
 }
 
 pub fn parse_queries(source: &str) -> Result<Vec<Query>> {
@@ -178,6 +195,17 @@ fn lex(source: &str) -> Result<Vec<Token>> {
                 kind: TokenKind::LeftParen,
                 span: Span::new(start, start + ch.len_utf8()),
             },
+            '.' => Token {
+                kind: TokenKind::Dot,
+                span: Span::new(start, start + ch.len_utf8()),
+            },
+            ':' if chars.peek().is_some_and(|(_, next)| *next == '-') => {
+                let (index, _) = chars.next().expect("peeked");
+                Token {
+                    kind: TokenKind::Implies,
+                    span: Span::new(start, index + '-'.len_utf8()),
+                }
+            }
             ')' => Token {
                 kind: TokenKind::RightParen,
                 span: Span::new(start, start + ch.len_utf8()),
@@ -386,6 +414,114 @@ impl<'a> Parser<'a> {
         }
 
         Ok(queries)
+    }
+
+    fn parse_program(&mut self) -> Result<Program> {
+        let mut program = Program::default();
+        while self.peek().is_some() {
+            let start = self.cursor;
+            let Ok(head) = self.parse_head() else {
+                self.cursor = start;
+                break;
+            };
+            if let Some(dot) = self.match_kind(|kind| matches!(kind, TokenKind::Dot)) {
+                program
+                    .facts
+                    .push(head.into_fact().map_err(|message| Error::Parse {
+                        diagnostics: vec![Diagnostic::new(message).with_span(dot.span)],
+                    })?);
+            } else if self
+                .match_kind(|kind| matches!(kind, TokenKind::Implies))
+                .is_some()
+            {
+                let mut body = vec![self.parse_clause()?];
+                while self
+                    .match_kind(|kind| matches!(kind, TokenKind::Comma))
+                    .is_some()
+                {
+                    body.push(self.parse_clause()?);
+                }
+                self.expect_kind(
+                    |kind| matches!(kind, TokenKind::Dot),
+                    "expected `,` or `.` after a rule's clause",
+                )?;
+                program.rules.push(Rule { head, body });
+            } else {
+                // Neither a fact nor a rule: the queries start here.
+                self.cursor = start;
+                break;
+            }
+        }
+        if self.peek().is_some() {
+            program.queries = self.parse_queries()?;
+        }
+        Ok(program)
+    }
+
+    /// A rule's head: an atom whose terms may be aggregates, `count(X)`.
+    fn parse_head(&mut self) -> Result<Head> {
+        let predicate = self.parse_predicate()?;
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::LeftParen),
+            "expected `(` after predicate",
+        )?;
+        let mut args = Vec::new();
+        if self
+            .match_kind(|kind| matches!(kind, TokenKind::RightParen))
+            .is_none()
+        {
+            loop {
+                args.push(self.parse_head_term()?);
+                if self
+                    .match_kind(|kind| matches!(kind, TokenKind::RightParen))
+                    .is_some()
+                {
+                    break;
+                }
+                self.expect_kind(
+                    |kind| matches!(kind, TokenKind::Comma),
+                    "expected `,` or `)` after term",
+                )?;
+            }
+        }
+        if predicate.is_empty() {
+            return Err(Error::EmptyPredicate);
+        }
+        Ok(Head { predicate, args })
+    }
+
+    fn parse_head_term(&mut self) -> Result<HeadTerm> {
+        let aggregate = match (
+            self.peek().map(|t| &t.kind),
+            self.peek_n(1).map(|t| &t.kind),
+        ) {
+            (Some(TokenKind::Identifier(name)), Some(TokenKind::LeftParen)) => {
+                Aggregate::named(name)
+            }
+            _ => None,
+        };
+        let Some(aggregate) = aggregate else {
+            return Ok(HeadTerm::Term(self.parse_term()?));
+        };
+        self.next();
+        self.next();
+        let variable = self.parse_term()?;
+        let Some(variable) = variable.var_name().map(str::to_owned) else {
+            return Err(Error::Parse {
+                diagnostics: vec![Diagnostic::new(format!(
+                    "`{}` aggregates a variable",
+                    aggregate.as_str()
+                ))],
+            });
+        };
+        self.expect_kind(
+            |kind| matches!(kind, TokenKind::RightParen),
+            "expected `)` after the aggregated variable",
+        )?;
+        Ok(HeadTerm::Aggregate {
+            aggregate,
+            variable,
+        })
     }
 
     fn parse_query_body(&mut self) -> Result<Query> {

@@ -60,6 +60,47 @@ Builtins are available as clauses:
 
 Negated atoms and builtin arguments must be grounded by earlier clauses. Evaluation is read-only and snapshot-oriented; facts are supplied by the caller.
 
+## Programs
+
+A program is facts and rules, then queries. Facts and rules end with `.`; rules may be
+recursive, and a head may aggregate (`count`, `sum`, `min`, `max`) a body variable,
+grouped by its other terms:
+
+```prolog
+layer("http", 3).
+layer("store", 1).
+
+path(X, Y) :- edge(X, Y).
+path(X, Z) :- path(X, Y), edge(Y, Z).
+out(X, count(Y)) :- edge(X, Y).
+
+path(1, Y); out(X, N), N > 10
+```
+
+`evaluate` computes the program's relations over a store to a fixpoint (semi-naive,
+bottom up by strata), and `Layered` puts them over the store, so queries read both:
+
+```rust
+use datafox::{DatafoxClient, DatafoxConfig, Layered, evaluate, parse_program};
+
+let program = parse_program(source)?;
+let derived = evaluate(&program, &storage, None)?;
+let layered = Layered::new(&storage, &derived);
+let datafox = DatafoxClient::new(DatafoxConfig::new(&layered))?;
+for query in &program.queries {
+    for substitution in datafox.eval(query)? {
+        println!("{substitution}");
+    }
+}
+```
+
+- Every head variable, and every variable of a negated atom, must be bound by a positive
+  atom of the body.
+- A rule may negate, or aggregate over, only relations that don't depend on its own:
+  otherwise evaluation fails with `NotStratifiable`, naming both relations.
+- `evaluate(&program, &storage, Some(&["out"]))` computes only the relations `out` needs.
+- A `Layered` store is a store, so programs layer: a library's relations under a rule's.
+
 Configure the runtime profile up front:
 
 ```rust

@@ -34,6 +34,17 @@ pub enum Error {
         expected: usize,
         found: usize,
     },
+    #[error(
+        "`{predicate}` depends on `{depends_on}` through a negation or an aggregate, in a cycle: the program can't be stratified"
+    )]
+    NotStratifiable {
+        predicate: String,
+        depends_on: String,
+    },
+    #[error("in a rule for `{predicate}`, `{variable}` isn't bound by a positive atom")]
+    UnsafeRule { predicate: String, variable: String },
+    #[error("invalid program: {message}")]
+    InvalidProgram { message: String },
     #[error("query parse failed")]
     Parse { diagnostics: Vec<Diagnostic> },
     #[error("failed to build evaluator: {message}")]

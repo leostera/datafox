@@ -36,6 +36,13 @@ impl Substitution {
         self.bindings.get(var)
     }
 
+    /// Every binding, by variable name.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.bindings
+            .iter()
+            .map(|(name, value)| (name.as_str(), value))
+    }
+
     pub fn contains(&self, var: &str) -> bool {
         self.bindings.contains_key(var)
     }

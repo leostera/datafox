@@ -48,6 +48,7 @@ mod parser;
 mod plan;
 mod prelude;
 mod pretty;
+mod program;
 mod storage;
 mod substitution;
 mod term;
@@ -63,10 +64,13 @@ pub use client::{
 pub use diagnostic::{Diagnostic, Span};
 pub use error::{Error, Result};
 pub use evaluator::{Evaluation, EvaluationStrategy};
-pub use parser::{parse_queries, parse_query};
+pub use parser::{parse_program, parse_queries, parse_query};
 pub use plan::{PREPARED_QUERY_FORMAT_VERSION, Plan, Planner, PreparedQuery};
 pub use prelude::{BinaryOperator, BinaryRelation, OperatorOutcome, Prelude, RelationOutcome};
 pub use pretty::{format_queries, format_query};
+pub use program::{
+    Aggregate, Derived, Head, HeadTerm, Layered, LayeredScan, Program, Rule, evaluate,
+};
 pub use storage::{
     AtomRole, FactEstimate, FactRequest, FactRequestHints, FactRequestMode, FactScan, FactStore,
     FactTuple, InMemoryStorage, PatternValue, Projection, SnapshotSelector, Storage, TupleStream,
