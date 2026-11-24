@@ -7,12 +7,17 @@
 //! previous round added.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{BuildHasher, Hash};
+
+use rustc_hash::{FxBuildHasher, FxHashMap};
+use std::slice;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Atom, Clause, DatafoxClient, DatafoxConfig, Error, FactEstimate, FactScan, FactStore,
-    FactTuple, InMemoryStorage, Query, Result, Term, Value,
+    Atom, Clause, DatafoxClient, DatafoxConfig, Error, FactEstimate, FactStore, FactTuple, Query,
+    Result, Term, Value, matches_pattern,
 };
 
 /// A program: facts, rules, and the queries to answer over them.
@@ -376,13 +381,176 @@ fn tarjan(edges: &[Vec<(usize, bool)>]) -> Vec<Vec<usize>> {
     state.components
 }
 
+/// Derived relations are hashed only to find tuples, never to resist an adversary, so with
+/// a fast hasher.
+fn hash_of(value: &impl Hash) -> u64 {
+    FxBuildHasher.hash_one(value)
+}
+
+type Index = FxHashMap<u64, Vec<u32>>;
+
+/// One derived relation: its tuples, each once, and an index per column from a value's
+/// hash to the tuples with that value there, built the first time a scan binds the column
+/// and kept up to date as tuples are added. Every scan checks each tuple against the whole
+/// pattern, so a collision costs a comparison, never a wrong answer.
+#[derive(Debug, Default)]
+struct Relation {
+    tuples: Vec<FactTuple>,
+    /// Tuples by their hash.
+    members: Index,
+    columns: Vec<OnceLock<Index>>,
+}
+
+impl Relation {
+    /// Adds `tuple`; returns whether it's new.
+    fn insert(&mut self, tuple: FactTuple) -> bool {
+        let hash = hash_of(&tuple);
+        let same = self.members.entry(hash).or_default();
+        if same.iter().any(|&ix| self.tuples[ix as usize] == tuple) {
+            return false;
+        }
+        let ix = u32::try_from(self.tuples.len()).expect("fewer than 2^32 tuples in a relation");
+        same.push(ix);
+        if self.columns.len() < tuple.len() {
+            self.columns.resize_with(tuple.len(), OnceLock::new);
+        }
+        for (column, value) in tuple.iter().enumerate() {
+            if let Some(index) = self.columns[column].get_mut() {
+                index.entry(hash_of(value)).or_default().push(ix);
+            }
+        }
+        self.tuples.push(tuple);
+        true
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tuples.is_empty()
+    }
+
+    fn column(&self, column: usize) -> Option<&Index> {
+        let index = self.columns.get(column)?;
+        Some(index.get_or_init(|| {
+            let mut index = Index::default();
+            for (ix, tuple) in self.tuples.iter().enumerate() {
+                if let Some(value) = tuple.get(column) {
+                    let ix = u32::try_from(ix).expect("fewer than 2^32 tuples in a relation");
+                    index.entry(hash_of(value)).or_default().push(ix);
+                }
+            }
+            index
+        }))
+    }
+
+    /// The tuples that can match `pattern`: those with the rarest of its bound values, or
+    /// every tuple (`Some(None)`) if it binds nothing; `None` if a bound value is in no
+    /// tuple.
+    fn candidates(&self, pattern: &[Option<Value>]) -> Option<Option<&[u32]>> {
+        let mut best: Option<&[u32]> = None;
+        for (column, value) in pattern.iter().enumerate() {
+            let Some(value) = value else { continue };
+            let ixs = self.column(column)?.get(&hash_of(value))?;
+            if best.is_none_or(|best| ixs.len() < best.len()) {
+                best = Some(ixs);
+            }
+        }
+        Some(best)
+    }
+
+    fn scan<'store, 'pattern>(
+        &'store self,
+        pattern: &'pattern [Option<Value>],
+    ) -> RelationScan<'store, 'pattern> {
+        match self.candidates(pattern) {
+            None => RelationScan::Empty,
+            Some(None) => RelationScan::All {
+                tuples: self.tuples.iter(),
+                pattern,
+            },
+            Some(Some(ixs)) => RelationScan::Indexed {
+                tuples: &self.tuples,
+                ixs: ixs.iter(),
+                pattern,
+            },
+        }
+    }
+
+    fn estimate(&self, pattern: &[Option<Value>]) -> FactEstimate {
+        match self.candidates(pattern) {
+            None => FactEstimate::exact(0),
+            Some(None) => FactEstimate::upper_bound(self.tuples.len()),
+            Some(Some(ixs)) => FactEstimate::upper_bound(ixs.len()),
+        }
+    }
+}
+
+/// The tuples of a derived relation that match a pattern.
+pub enum RelationScan<'store, 'pattern> {
+    Empty,
+    All {
+        tuples: slice::Iter<'store, FactTuple>,
+        pattern: &'pattern [Option<Value>],
+    },
+    Indexed {
+        tuples: &'store [FactTuple],
+        ixs: slice::Iter<'store, u32>,
+        pattern: &'pattern [Option<Value>],
+    },
+}
+
+impl<'store> Iterator for RelationScan<'store, '_> {
+    type Item = &'store FactTuple;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Empty => None,
+            Self::All { tuples, pattern } => tuples.find(|tuple| matches_pattern(pattern, tuple)),
+            Self::Indexed {
+                tuples,
+                ixs,
+                pattern,
+            } => ixs.find_map(|&ix| {
+                let tuple = &tuples[ix as usize];
+                matches_pattern(pattern, tuple).then_some(tuple)
+            }),
+        }
+    }
+}
+
+/// Derived relations by name.
+#[derive(Debug, Default)]
+struct Relations(FxHashMap<String, Relation>);
+
+impl Relations {
+    fn scan<'store, 'pattern>(
+        &'store self,
+        predicate: &str,
+        pattern: &'pattern [Option<Value>],
+    ) -> RelationScan<'store, 'pattern> {
+        self.0
+            .get(predicate)
+            .map_or(RelationScan::Empty, |relation| relation.scan(pattern))
+    }
+
+    fn estimate(&self, predicate: &str, pattern: &[Option<Value>]) -> FactEstimate {
+        self.0
+            .get(predicate)
+            .map_or(FactEstimate::exact(0), |relation| {
+                relation.estimate(pattern)
+            })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.values().all(Relation::is_empty)
+    }
+}
+
 /// The relations a program derived, over the store it was evaluated on.
 #[derive(Debug, Default)]
 pub struct Derived {
-    relations: InMemoryStorage,
-    seen: HashMap<String, HashSet<FactTuple>>,
-    /// The tuples the last round added, by predicate, while a stratum is evaluated.
-    delta: InMemoryStorage,
+    relations: Relations,
+    /// The tuples the last round added, under their delta names, while a stratum is
+    /// evaluated.
+    delta: Relations,
 }
 
 /// The name a recursive atom reads the last round's tuples under.
@@ -393,32 +561,33 @@ fn delta_name(predicate: &str) -> String {
 impl Derived {
     /// Whether the program defines `predicate`.
     pub fn defines(&self, predicate: &str) -> bool {
-        self.seen.contains_key(predicate)
+        self.relations.0.contains_key(predicate)
     }
 
     /// The tuples of `predicate`, if the program defines it.
-    pub fn tuples(&self, predicate: &str) -> Vec<&FactTuple> {
-        self.relations.scan(predicate, &[]).collect()
+    pub fn tuples(&self, predicate: &str) -> &[FactTuple] {
+        self.relations
+            .0
+            .get(predicate)
+            .map_or(&[], |relation| relation.tuples.as_slice())
     }
 
     /// How many tuples `predicate` has.
     pub fn len(&self, predicate: &str) -> usize {
-        self.seen.get(predicate).map_or(0, HashSet::len)
+        self.tuples(predicate).len()
     }
 
     fn define(&mut self, predicate: &str) {
-        self.seen.entry(predicate.to_owned()).or_default();
+        self.relations.0.entry(predicate.to_owned()).or_default();
     }
 
     /// Adds `tuple` to `predicate`; returns whether it's new.
     fn insert(&mut self, predicate: &str, tuple: FactTuple) -> bool {
-        let seen = self.seen.entry(predicate.to_owned()).or_default();
-        if seen.insert(tuple.clone()) {
-            self.relations.insert(predicate.to_owned(), tuple);
-            true
-        } else {
-            false
-        }
+        self.relations
+            .0
+            .entry(predicate.to_owned())
+            .or_default()
+            .insert(tuple)
     }
 }
 
@@ -437,7 +606,7 @@ impl<'a, S: FactStore + ?Sized> Layered<'a, S> {
 
 /// A scan of a layered store: from what was derived, or from the store below.
 pub enum LayeredScan<'store, 'pattern, B> {
-    Derived(FactScan<'store, 'pattern>),
+    Derived(RelationScan<'store, 'pattern>),
     Below(B),
 }
 
@@ -538,9 +707,12 @@ fn evaluate_stratum<S: FactStore + ?Sized>(
     let recursive = |atom: &Atom| stratum.contains(&atom.predicate);
 
     // The first round reads every relation whole.
-    let mut added: Vec<(String, FactTuple)> = Vec::new();
+    let mut added: Vec<(&str, Vec<FactTuple>)> = Vec::new();
     for rule in &rules {
-        added.extend(solve(rule, &rule.body, store, derived)?);
+        added.push((
+            rule.head.predicate.as_str(),
+            solve(rule, &rule.body, store, derived)?,
+        ));
     }
     let mut delta = commit(derived, added);
 
@@ -548,10 +720,7 @@ fn evaluate_stratum<S: FactStore + ?Sized>(
         .iter()
         .any(|rule| rule.positive_atoms().any(recursive));
     while any_recursive && !delta.is_empty() {
-        derived.delta = InMemoryStorage::new();
-        for (predicate, tuple) in delta {
-            derived.delta.insert(delta_name(&predicate), tuple);
-        }
+        derived.delta = delta;
         let mut added = Vec::new();
         for rule in &rules {
             for (position, clause) in rule.body.iter().enumerate() {
@@ -566,21 +735,30 @@ fn evaluate_stratum<S: FactStore + ?Sized>(
                     predicate: delta_name(&atom.predicate),
                     args: atom.args.clone(),
                 });
-                added.extend(solve(rule, &body, store, derived)?);
+                added.push((
+                    rule.head.predicate.as_str(),
+                    solve(rule, &body, store, derived)?,
+                ));
             }
         }
         delta = commit(derived, added);
     }
-    derived.delta = InMemoryStorage::new();
+    derived.delta = Relations::default();
     Ok(())
 }
 
-/// Adds tuples to what was derived; returns the ones that were new.
-fn commit(derived: &mut Derived, added: Vec<(String, FactTuple)>) -> Vec<(String, FactTuple)> {
-    added
-        .into_iter()
-        .filter(|(predicate, tuple)| derived.insert(predicate, tuple.clone()))
-        .collect()
+/// Adds tuples to what was derived; returns the ones that were new, under their delta names.
+fn commit(derived: &mut Derived, added: Vec<(&str, Vec<FactTuple>)>) -> Relations {
+    let mut delta = Relations::default();
+    for (predicate, tuples) in added {
+        let name = delta_name(predicate);
+        for tuple in tuples {
+            if derived.insert(predicate, tuple.clone()) {
+                delta.0.entry(name.clone()).or_default().insert(tuple);
+            }
+        }
+    }
+    delta
 }
 
 /// The head tuples `body` gives `rule`, aggregated if its head aggregates.
@@ -589,7 +767,7 @@ fn solve<S: FactStore + ?Sized>(
     body: &[Clause],
     store: &S,
     derived: &Derived,
-) -> Result<Vec<(String, FactTuple)>> {
+) -> Result<Vec<FactTuple>> {
     let layered = Layered::new(store, derived);
     let query = match body {
         [Clause::Atom(atom)] => Query::single(atom.clone()),
@@ -597,12 +775,10 @@ fn solve<S: FactStore + ?Sized>(
     };
     let client = DatafoxClient::new(DatafoxConfig::new(&layered).serial())?;
     let solutions = client.eval(&query)?;
-    let predicate = rule.head.predicate.clone();
     if !rule.head.is_aggregate() {
         return Ok(solutions
             .map(|solution| {
-                let tuple = rule
-                    .head
+                rule.head
                     .args
                     .iter()
                     .map(|term| match term {
@@ -615,8 +791,7 @@ fn solve<S: FactStore + ?Sized>(
                         }
                         HeadTerm::Aggregate { .. } => unreachable!("not an aggregate"),
                     })
-                    .collect();
-                (predicate.clone(), tuple)
+                    .collect()
             })
             .collect());
     }
@@ -661,7 +836,7 @@ fn solve<S: FactStore + ?Sized>(
                 HeadTerm::Term(_) => tuple.push(key.next().expect("one per term")),
             }
         }
-        tuples.push((predicate.clone(), tuple));
+        tuples.push(tuple);
     }
     Ok(tuples)
 }
@@ -698,7 +873,7 @@ fn fold(aggregate: Aggregate, predicate: &str, values: Vec<Value>) -> Result<Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Substitution, parse_program};
+    use crate::{InMemoryStorage, Substitution, parse_program};
 
     fn store() -> InMemoryStorage {
         let edge = |a: i64, b: i64| vec![Value::integer(a), Value::integer(b)];
