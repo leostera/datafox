@@ -207,6 +207,7 @@ fn default_relations() -> Vec<BinaryRelation> {
     vec![
         BinaryRelation::from_bool("=", |left, right| left == right),
         BinaryRelation::from_bool("eq", |left, right| left == right),
+        BinaryRelation::from_bool("!=", |left, right| left != right),
         BinaryRelation::from_bool("<", |left, right| {
             values_are_ordered_compatibly(left, right) && left < right
         }),

@@ -1212,6 +1212,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn evaluator_supports_not_equal() -> Result<()> {
+        let universe = Universe::new(InMemoryStorage::from_facts([(
+            "edge".to_string(),
+            vec![
+                vec![Value::integer(1), Value::integer(1)],
+                vec![Value::integer(1), Value::integer(2)],
+                vec![Value::string("a"), Value::integer(1)],
+            ],
+        )]));
+        let query = parse_query("edge(X, Y), X != Y")?;
+
+        let results =
+            collect_results(Evaluator::<InMemoryStorage>::evaluate(&universe, &query).await?)
+                .await?;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].lookup("X"), Some(&Value::integer(1)));
+        assert_eq!(results[0].lookup("Y"), Some(&Value::integer(2)));
+        assert_eq!(results[1].lookup("X"), Some(&Value::string("a")));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn evaluator_supports_named_string_builtins() -> Result<()> {
         let universe = Universe::new(InMemoryStorage::from_facts([(
             "spotify:displayName".to_string(),

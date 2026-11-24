@@ -45,12 +45,13 @@ fn main() -> datafox::Result<()> {
 | Query set | `node(Node); edge(From, To)` |
 | Quoted predicate | `'local://schema/name'(Entity, Value)` |
 | Binary expression | `(Line + 1) = 42` |
+| Comment | `% to the end of the line` |
 
 Builtins are available as clauses:
 
 | Builtin | Example |
 | --- | --- |
-| Equality and order | `Start < End`, `A = B` |
+| Equality and order | `Start < End`, `A = B`, `A != B` |
 | String matching | `startsWith(Name, "lint")` |
 | Negative string matching | `notContains(Text, "dbg!")` |
 | Regex matching | `matchesRegex(Text, "^dbg!")` |

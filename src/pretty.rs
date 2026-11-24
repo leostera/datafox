@@ -94,7 +94,7 @@ fn is_identifier(value: &str) -> bool {
 }
 
 fn is_infix_relation(name: &str) -> bool {
-    matches!(name, "=" | "<" | "<=" | ">" | ">=")
+    matches!(name, "=" | "!=" | "<" | "<=" | ">" | ">=")
 }
 
 fn is_infix_operator(name: &str) -> bool {
@@ -129,6 +129,13 @@ mod tests {
             format_queries(&queries),
             "node(Node, \"call_expression\", _, _, _, _),\n  text(Node, Text);\n\n!skip(Node),\n  X >= 1"
         );
+    }
+
+    #[test]
+    fn formats_not_equal_infix() {
+        let query = parse_query("edge(A, B), A != B").expect("query");
+
+        assert_eq!(crate::format_query(&query), "edge(A, B),\n  A != B");
     }
 
     #[test]

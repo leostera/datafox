@@ -11,6 +11,7 @@ enum TokenKind {
     Quoted(String),
     Underscore,
     Bang,
+    NotEqual,
     Equal,
     Comma,
     Semicolon,
@@ -62,10 +63,29 @@ fn lex(source: &str) -> Result<Vec<Token>> {
         }
 
         let token = match ch {
-            '!' => Token {
-                kind: TokenKind::Bang,
-                span: Span::new(start, start + ch.len_utf8()),
-            },
+            // `%` starts a comment that runs to the end of the line.
+            '%' => {
+                for (_, next) in chars.by_ref() {
+                    if next == '\n' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            '!' => {
+                if let Some((index, '=')) = chars.peek().copied() {
+                    chars.next();
+                    Token {
+                        kind: TokenKind::NotEqual,
+                        span: Span::new(start, index + '='.len_utf8()),
+                    }
+                } else {
+                    Token {
+                        kind: TokenKind::Bang,
+                        span: Span::new(start, start + ch.len_utf8()),
+                    }
+                }
+            }
             '=' => Token {
                 kind: TokenKind::Equal,
                 span: Span::new(start, start + ch.len_utf8()),
@@ -433,6 +453,7 @@ impl<'a> Parser<'a> {
             TokenKind::LessThan => "<",
             TokenKind::LessThanOrEqual => "<=",
             TokenKind::Equal => "=",
+            TokenKind::NotEqual => "!=",
             _ => {
                 return Err(Error::Parse {
                     diagnostics: vec![
@@ -660,6 +681,7 @@ impl<'a> Parser<'a> {
                     | TokenKind::LessThan
                     | TokenKind::LessThanOrEqual
                     | TokenKind::Equal
+                    | TokenKind::NotEqual
             )
         })
     }
@@ -862,6 +884,72 @@ mod tests {
             ])
             .expect("multi"),
         );
+    }
+
+    #[test]
+    fn parses_not_equal_as_an_infix_builtin() {
+        let query = parse_query("edge(A, B), A != B, !loop(A)").expect("query");
+
+        assert_eq!(
+            query,
+            Query::multi(vec![
+                Clause::atom(
+                    Atom::new(
+                        "edge",
+                        vec![
+                            Term::variable("A").expect("variable"),
+                            Term::variable("B").expect("variable"),
+                        ],
+                    )
+                    .expect("atom"),
+                ),
+                Clause::builtin(
+                    "!=",
+                    vec![
+                        Term::variable("A").expect("variable"),
+                        Term::variable("B").expect("variable"),
+                    ],
+                ),
+                Clause::negated(
+                    Atom::new("loop", vec![Term::variable("A").expect("variable")]).expect("atom"),
+                ),
+            ])
+            .expect("multi"),
+        );
+    }
+
+    #[test]
+    fn skips_percent_comments_to_the_end_of_the_line() {
+        let source = "% Every edge that leaves its node.\n\
+                      edge(A, B), % the edge\n\
+                      A != B % its ends differ";
+        let query = parse_query(source).expect("query");
+
+        assert_eq!(query, parse_query("edge(A, B), A != B").expect("query"));
+    }
+
+    #[test]
+    fn keeps_percent_signs_inside_strings() {
+        let query = parse_query(r#"label(X, "100%")"#).expect("query");
+
+        assert_eq!(
+            query,
+            Query::single(
+                Atom::new(
+                    "label",
+                    vec![
+                        Term::variable("X").expect("variable"),
+                        Term::constant(Value::string("100%")),
+                    ],
+                )
+                .expect("atom"),
+            ),
+        );
+    }
+
+    #[test]
+    fn a_query_of_only_comments_is_empty() {
+        assert!(parse_query("% nothing here\n% at all").is_err());
     }
 
     #[test]
