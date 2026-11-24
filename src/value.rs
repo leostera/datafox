@@ -1,10 +1,15 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// Concrete constant values that can appear in Datalog facts and queries.
+///
+/// A string is shared: evaluation copies values into every solution, and a copy of an
+/// `Arc` is a count, not an allocation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Value {
     Integer(i64),
-    String(String),
+    String(Arc<str>),
 }
 
 impl Value {
@@ -12,8 +17,16 @@ impl Value {
         Self::Integer(value)
     }
 
-    pub fn string(value: impl Into<String>) -> Self {
+    pub fn string(value: impl Into<Arc<str>>) -> Self {
         Self::String(value.into())
+    }
+
+    /// The text of a string value.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(text) => Some(text),
+            Self::Integer(_) => None,
+        }
     }
 }
 
@@ -31,13 +44,19 @@ impl From<i32> for Value {
 
 impl From<String> for Value {
     fn from(value: String) -> Self {
-        Self::String(value)
+        Self::String(value.into())
     }
 }
 
 impl From<&str> for Value {
     fn from(value: &str) -> Self {
-        Self::String(value.to_string())
+        Self::String(value.into())
+    }
+}
+
+impl From<Arc<str>> for Value {
+    fn from(value: Arc<str>) -> Self {
+        Self::String(value)
     }
 }
 
