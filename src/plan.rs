@@ -734,16 +734,14 @@ mod tests {
 
     #[test]
     fn planner_runs_a_builtin_as_soon_as_its_variables_are_bound() -> Result<()> {
-        let pair = |a: i64, b: i64| vec![Value::integer(a), Value::integer(b)];
+        let row = |i: i64| vec![Value::integer(i), Value::integer(i), Value::integer(i)];
         let storage = InMemoryStorage::from_facts([
-            ("import".to_string(), (0..200).map(|i| pair(i, i)).collect()),
-            (
-                "resolved".to_string(),
-                (0..300).map(|i| pair(i, i)).collect(),
-            ),
+            ("import".to_string(), (0..200).map(row).collect()),
+            ("resolved".to_string(), (0..300).map(row).collect()),
         ]);
         let prelude = Prelude::new();
-        let query = parse_query("import(F, N), resolved(F, S), N > 190")?;
+        // `resolved` would have two of its variables bound, and `>` only one.
+        let query = parse_query("import(F, N, T), resolved(F, T, S), N > 190")?;
 
         let plan = Planner::new(&storage, &prelude).plan(&query)?;
 
