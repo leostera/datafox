@@ -612,98 +612,190 @@ pub(crate) async fn eval_plan_streaming<S>(
 where
     S: Storage + ?Sized,
 {
-    let executable = plan.bind(prelude)?;
-    let mut seeds = vec![PlanSeed::new(executable.variable_count())];
-
-    for clause in executable.clauses() {
-        let mut next_seeds = Vec::new();
-        match clause {
-            PlannedClause::Atom(atom) => {
-                for seed in seeds {
-                    next_seeds.extend(
-                        query_streaming_planned_atom_matches(
-                            storage,
-                            prelude,
-                            &executable,
-                            atom,
-                            &seed,
-                            AtomRole::Positive,
-                        )
-                        .await?,
-                    );
-                }
-            }
-            PlannedClause::Negated(atom) => {
-                for seed in seeds {
-                    let matches = query_streaming_planned_atom_matches(
-                        storage,
-                        prelude,
-                        &executable,
-                        atom,
-                        &seed,
-                        AtomRole::Negated,
-                    )
-                    .await?;
-                    if matches.is_empty() {
-                        next_seeds.push(seed);
-                    }
-                }
-            }
-            PlannedClause::Relation(relation) => {
-                for seed in seeds {
-                    if evaluate_planned_relation(relation, &seed, &executable)? {
-                        next_seeds.push(seed);
-                    }
-                }
-            }
-        }
-        seeds = next_seeds;
-    }
-
-    let substitutions = seeds
-        .into_iter()
-        .map(|seed| seed.into_substitution(&executable))
-        .collect();
+    let mut substitutions = Vec::new();
+    stream_plan(storage, prelude, plan, &mut |substitution| {
+        substitutions.push(substitution);
+        Ok(())
+    })
+    .await?;
     Ok(Evaluation::new(substitutions))
 }
 
-async fn query_streaming_planned_atom_matches<S>(
+/// How many bindings go on from one clause to the next at once, and so how many lookups a
+/// store is asked for in one request.
+pub(crate) const BATCH: usize = 256;
+
+/// What answers go to as they're found.
+pub type Answer<'a> = dyn FnMut(Substitution) -> Result<()> + Send + 'a;
+
+/// Evaluates `plan` over `storage`, handing each answer to `answer` as it's found.
+///
+/// A clause's matches go on to the next clause in batches of [`BATCH`] while the stream
+/// they came from waits, so what the evaluation holds at once is bounded by the batch and
+/// the query's length, not by the size of any relation it reads. The lookups a batch needs
+/// are asked for in one request ([`Storage::get_facts_many`]).
+pub(crate) async fn stream_plan<S>(
     storage: &S,
     prelude: &Prelude,
-    plan: &ExecutablePlan<'_>,
-    atom: &PlannedAtom,
-    seed: &PlanSeed,
-    role: AtomRole,
-) -> Result<Vec<PlanSeed>>
+    plan: &Plan,
+    answer: &mut Answer<'_>,
+) -> Result<()>
 where
     S: Storage + ?Sized,
 {
-    let predicate = plan.predicate_name(atom.predicate);
-    let pattern = planned_atom_to_pattern(atom, seed, plan)?;
-    let request = FactRequest::matching(predicate, pattern.clone())
-        .with_role(role)
-        .with_equality_groups(planned_atom_equality_groups(atom))
-        .with_mode(match role {
-            AtomRole::Positive => FactRequestMode::Tuples,
-            AtomRole::Negated => FactRequestMode::Exists,
-        });
-    let mut substitutions = Vec::new();
-    let mut tuples = storage.get_facts(request).await?;
+    let executable = plan.bind(prelude)?;
+    let pipeline = Pipeline {
+        storage,
+        prelude,
+        plan: &executable,
+    };
+    let root = vec![PlanSeed::new(executable.variable_count())];
+    pipeline.run(0, root, answer).await
+}
 
-    while let Some(tuple) = tuples.recv().await {
-        let tuple = tuple?;
-        if let Some(substitution) = match_planned_atom(seed, atom, &tuple, plan)? {
-            substitutions.push(substitution);
-        }
+/// A plan being evaluated over a store, clause by clause.
+struct Pipeline<'a, S: Storage + ?Sized> {
+    storage: &'a S,
+    prelude: &'a Prelude,
+    plan: &'a ExecutablePlan<'a>,
+}
+
+type Step<'b> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'b>>;
+
+impl<'a, S: Storage + ?Sized> Pipeline<'a, S> {
+    /// Takes `seeds`, at most [`BATCH`] bindings of the clauses before `clause`, through
+    /// `clause` and the ones after it.
+    fn run<'b>(
+        &'b self,
+        clause: usize,
+        seeds: Vec<PlanSeed>,
+        answer: &'b mut Answer<'_>,
+    ) -> Step<'b>
+    where
+        'a: 'b,
+    {
+        Box::pin(async move {
+            let Some(planned) = self.plan.clauses().get(clause) else {
+                for seed in seeds {
+                    answer(seed.into_substitution(self.plan))?;
+                }
+                return Ok(());
+            };
+            let next = clause + 1;
+            match planned {
+                PlannedClause::Relation(relation) => {
+                    let mut kept = Vec::with_capacity(seeds.len());
+                    for seed in seeds {
+                        if evaluate_planned_relation(relation, &seed, self.plan)? {
+                            kept.push(seed);
+                        }
+                    }
+                    if !kept.is_empty() {
+                        self.run(next, kept, answer).await?;
+                    }
+                }
+                PlannedClause::Negated(atom) => {
+                    let found = self.matched(atom, &seeds).await?;
+                    let kept: Vec<PlanSeed> = seeds
+                        .into_iter()
+                        .zip(found)
+                        .filter_map(|(seed, found)| (!found).then_some(seed))
+                        .collect();
+                    if !kept.is_empty() {
+                        self.run(next, kept, answer).await?;
+                    }
+                }
+                PlannedClause::Atom(atom) => {
+                    let requests = self.requests(atom, &seeds, AtomRole::Positive)?;
+                    let mut tuples = self.storage.get_facts_many(requests).await?;
+                    let mut matched = Vec::new();
+                    while let Some(found) = tuples.recv().await {
+                        let (index, tuple) = found?;
+                        if let Some(seed) =
+                            match_planned_atom(&seeds[index], atom, &tuple, self.plan)?
+                        {
+                            matched.push(seed);
+                            if matched.len() == BATCH {
+                                self.run(next, std::mem::take(&mut matched), answer).await?;
+                            }
+                        }
+                    }
+                    for seed in &seeds {
+                        for tuple in self.prelude_facts(atom, seed)? {
+                            if let Some(seed) = match_planned_atom(seed, atom, &tuple, self.plan)? {
+                                matched.push(seed);
+                            }
+                        }
+                    }
+                    if !matched.is_empty() {
+                        self.run(next, matched, answer).await?;
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
-    for tuple in prelude.facts().scan(predicate, &pattern) {
-        if let Some(substitution) = match_planned_atom(seed, atom, tuple, plan)? {
-            substitutions.push(substitution);
+    /// Whether each of `seeds` matches `atom`: what a negated atom asks.
+    async fn matched(&self, atom: &PlannedAtom, seeds: &[PlanSeed]) -> Result<Vec<bool>> {
+        let mut found = vec![false; seeds.len()];
+        let requests = self.requests(atom, seeds, AtomRole::Negated)?;
+        let mut tuples = self.storage.get_facts_many(requests).await?;
+        while let Some(tuple) = tuples.recv().await {
+            let (index, tuple) = tuple?;
+            if match_planned_atom(&seeds[index], atom, &tuple, self.plan)?.is_some() {
+                found[index] = true;
+            }
         }
+        for (index, seed) in seeds.iter().enumerate() {
+            if found[index] {
+                continue;
+            }
+            for tuple in self.prelude_facts(atom, seed)? {
+                if match_planned_atom(seed, atom, &tuple, self.plan)?.is_some() {
+                    found[index] = true;
+                    break;
+                }
+            }
+        }
+        Ok(found)
     }
 
-    Ok(substitutions)
+    /// One request per seed: `atom`'s tuples with what the seed binds.
+    fn requests(
+        &self,
+        atom: &PlannedAtom,
+        seeds: &[PlanSeed],
+        role: AtomRole,
+    ) -> Result<Vec<FactRequest>> {
+        let predicate = self.plan.predicate_name(atom.predicate);
+        let groups = planned_atom_equality_groups(atom);
+        seeds
+            .iter()
+            .map(|seed| {
+                let pattern = planned_atom_to_pattern(atom, seed, self.plan)?;
+                Ok(FactRequest::matching(predicate, pattern)
+                    .with_role(role)
+                    .with_equality_groups(groups.clone())
+                    .with_mode(match role {
+                        AtomRole::Positive => FactRequestMode::Tuples,
+                        AtomRole::Negated => FactRequestMode::Exists,
+                    }))
+            })
+            .collect()
+    }
+
+    /// The prelude's facts for `atom`, with what `seed` binds.
+    fn prelude_facts(&self, atom: &PlannedAtom, seed: &PlanSeed) -> Result<Vec<Vec<Value>>> {
+        let predicate = self.plan.predicate_name(atom.predicate);
+        let pattern = planned_atom_to_pattern(atom, seed, self.plan)?;
+        Ok(self
+            .prelude
+            .facts()
+            .scan(predicate, &pattern)
+            .cloned()
+            .collect())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -971,6 +1063,125 @@ fn flatten_chunks<T>(chunks: Vec<Vec<T>>) -> Vec<T> {
 
 fn flatten_options<T>(values: Vec<Option<T>>) -> Vec<T> {
     values.into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
+
+    use super::BATCH;
+    use crate::{
+        DatafoxClient, DatafoxConfig, FactRequest, Result, Storage, TaggedTupleStream, TupleStream,
+        Value, finished_stream, parse_query,
+    };
+
+    /// `big(N)` for N in 0..BIG, produced lazily; `small(N, N)` for even N. Records what
+    /// it was asked for, and when `big` was done.
+    #[derive(Default, Clone)]
+    struct Recording {
+        events: Arc<Mutex<Vec<String>>>,
+        batches: Arc<Mutex<Vec<usize>>>,
+    }
+
+    const BIG: i64 = 1000;
+
+    #[async_trait]
+    impl Storage for Recording {
+        async fn get_facts(&self, request: FactRequest) -> Result<TupleStream> {
+            let pattern = request.pattern_options();
+            match request.predicate.as_str() {
+                "big" => {
+                    let (tx, rx) = mpsc::channel(16);
+                    let events = Arc::clone(&self.events);
+                    tokio::spawn(async move {
+                        for n in 0..BIG {
+                            if tx.send(Ok(vec![Value::integer(n)])).await.is_err() {
+                                return;
+                            }
+                        }
+                        events.lock().unwrap().push("big done".to_owned());
+                    });
+                    Ok(rx)
+                }
+                _ => {
+                    self.events.lock().unwrap().push("small asked".to_owned());
+                    let tuples = match &pattern[..] {
+                        [Some(Value::Integer(n)), None] if n % 2 == 0 => {
+                            vec![Ok(vec![Value::integer(*n), Value::integer(*n)])]
+                        }
+                        _ => Vec::new(),
+                    };
+                    Ok(finished_stream(tuples))
+                }
+            }
+        }
+
+        async fn get_facts_many(&self, requests: Vec<FactRequest>) -> Result<TaggedTupleStream> {
+            self.batches.lock().unwrap().push(requests.len());
+            if requests.len() == 1 {
+                let mut tuples = self.get_facts(requests.into_iter().next().unwrap()).await?;
+                let (tx, rx) = mpsc::channel(16);
+                tokio::spawn(async move {
+                    while let Some(tuple) = tuples.recv().await {
+                        if tx.send(tuple.map(|tuple| (0, tuple))).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+                return Ok(rx);
+            }
+            let mut found = Vec::new();
+            for (index, request) in requests.into_iter().enumerate() {
+                let mut tuples = self.get_facts(request).await?;
+                while let Some(tuple) = tuples.recv().await {
+                    found.push(tuple.map(|tuple| (index, tuple)));
+                }
+            }
+            Ok(finished_stream(found))
+        }
+    }
+
+    async fn answers(storage: &Recording) -> Result<usize> {
+        let client = DatafoxClient::new(DatafoxConfig::new(storage))?;
+        let mut count = 0;
+        client
+            .stream(&parse_query("big(X), small(X, Y)")?, &mut |_| {
+                count += 1;
+                Ok(())
+            })
+            .await?;
+        Ok(count)
+    }
+
+    #[tokio::test]
+    async fn a_clause_s_matches_go_on_before_its_stream_ends() -> Result<()> {
+        let storage = Recording::default();
+        assert_eq!(answers(&storage).await?, 500);
+        let events = storage.events.lock().unwrap().clone();
+        let first_small = events.iter().position(|e| e == "small asked").unwrap();
+        let big_done = events.iter().position(|e| e == "big done").unwrap();
+        assert!(
+            first_small < big_done,
+            "`small` was asked for while `big` still streamed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lookups_are_asked_for_a_batch_at_a_time() -> Result<()> {
+        let storage = Recording::default();
+        answers(&storage).await?;
+        let batches = storage.batches.lock().unwrap().clone();
+        // One request for all of `big`, then `small`'s lookups, BATCH at a time.
+        assert_eq!(batches[0], 1);
+        assert_eq!(batches[1..].iter().sum::<usize>(), BIG as usize);
+        assert!(batches[1..].iter().all(|&n| n <= BATCH));
+        assert_eq!(batches.len() - 1, (BIG as usize).div_ceil(BATCH));
+        Ok(())
+    }
 }
 
 #[cfg(test)]

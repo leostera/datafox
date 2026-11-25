@@ -11,6 +11,19 @@ use crate::{Result, Value};
 pub type FactTuple = Vec<Value>;
 pub type TupleStream = mpsc::Receiver<Result<FactTuple>>;
 
+/// The tuples of many requests, each with the index of the request it answers.
+pub type TaggedTupleStream = mpsc::Receiver<Result<(usize, FactTuple)>>;
+
+/// A stream that is done: `items`, already found.
+pub fn finished_stream<T: Send + 'static>(items: Vec<T>) -> mpsc::Receiver<T> {
+    let (tx, rx) = mpsc::channel(items.len().max(1));
+    for item in items {
+        tx.try_send(item)
+            .expect("the channel has room for every item");
+    }
+    rx
+}
+
 const DEFAULT_STREAM_BUFFER: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +150,20 @@ pub trait Storage: Send + Sync {
         self.get_facts(FactRequest::matching(predicate, pattern))
             .await
     }
+
+    /// The tuples each of `requests` asks for, each with its request's index, in any order.
+    /// An evaluation asks for a batch of lookups at once; a store that can answer them in
+    /// one job (one query, one round trip) overrides this, which asks one at a time.
+    async fn get_facts_many(&self, requests: Vec<FactRequest>) -> Result<TaggedTupleStream> {
+        let mut found = Vec::new();
+        for (index, request) in requests.into_iter().enumerate() {
+            let mut tuples = self.get_facts(request).await?;
+            while let Some(tuple) = tuples.recv().await {
+                found.push(tuple.map(|tuple| (index, tuple)));
+            }
+        }
+        Ok(finished_stream(found))
+    }
 }
 
 #[async_trait]
@@ -146,6 +173,10 @@ where
 {
     async fn get_facts(&self, request: FactRequest) -> Result<TupleStream> {
         (**self).get_facts(request).await
+    }
+
+    async fn get_facts_many(&self, requests: Vec<FactRequest>) -> Result<TaggedTupleStream> {
+        (**self).get_facts_many(requests).await
     }
 }
 

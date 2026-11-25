@@ -15,9 +15,12 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+use async_trait::async_trait;
+
 use crate::{
-    Atom, Clause, DatafoxClient, DatafoxConfig, Error, FactEstimate, FactStore, FactTuple, Query,
-    Result, Term, Value, matches_pattern,
+    Atom, Clause, DatafoxClient, DatafoxConfig, Error, FactEstimate, FactRequest, FactRequestMode,
+    FactStore, FactTuple, Query, Result, Storage, Substitution, TaggedTupleStream, Term,
+    TupleStream, Value, finished_stream, matches_pattern,
 };
 
 /// A program: facts, rules, and the queries to answer over them.
@@ -581,6 +584,26 @@ impl Derived {
         self.relations.0.entry(predicate.to_owned()).or_default();
     }
 
+    /// Defines the relations of `stratum`, with the program's facts of them.
+    fn start(&mut self, program: &Program, stratum: &[String]) {
+        for predicate in stratum {
+            self.define(predicate);
+        }
+        for fact in program
+            .facts
+            .iter()
+            .filter(|f| stratum.contains(&f.predicate))
+        {
+            let tuple = fact
+                .args
+                .iter()
+                .filter_map(Term::const_value)
+                .cloned()
+                .collect();
+            self.insert(&fact.predicate, tuple);
+        }
+    }
+
     /// Adds `tuple` to `predicate`; returns whether it's new.
     fn insert(&mut self, predicate: &str, tuple: FactTuple) -> bool {
         self.relations
@@ -652,6 +675,95 @@ impl<S: FactStore + ?Sized> FactStore for Layered<'_, S> {
     }
 }
 
+/// [`Layered`], as a [`Storage`]: what was derived from memory, the rest asked of the
+/// storage below.
+pub struct LayeredStorage<'a, S: Storage + ?Sized> {
+    below: &'a S,
+    derived: &'a Derived,
+}
+
+impl<'a, S: Storage + ?Sized> LayeredStorage<'a, S> {
+    pub fn new(below: &'a S, derived: &'a Derived) -> Self {
+        Self { below, derived }
+    }
+
+    /// The relations in memory that hold `predicate`, if they do.
+    fn in_memory(&self, predicate: &str) -> Option<&Relations> {
+        if predicate.starts_with('\u{0}') {
+            Some(&self.derived.delta)
+        } else if self.derived.defines(predicate) {
+            Some(&self.derived.relations)
+        } else {
+            None
+        }
+    }
+}
+
+/// The tuples of `relations` a request asks for.
+fn answer(relations: &Relations, request: &FactRequest) -> Vec<FactTuple> {
+    let pattern = request.pattern_options();
+    let limit = match request.mode {
+        FactRequestMode::Tuples => request.hints.limit,
+        FactRequestMode::Exists => Some(request.hints.limit.unwrap_or(1)),
+    };
+    relations
+        .scan(&request.predicate, &pattern)
+        .take(limit.unwrap_or(usize::MAX))
+        .cloned()
+        .collect()
+}
+
+#[async_trait]
+impl<S: Storage + ?Sized> Storage for LayeredStorage<'_, S> {
+    async fn get_facts(&self, request: FactRequest) -> Result<TupleStream> {
+        match self.in_memory(&request.predicate) {
+            Some(relations) => Ok(finished_stream(
+                answer(relations, &request).into_iter().map(Ok).collect(),
+            )),
+            None => self.below.get_facts(request).await,
+        }
+    }
+
+    async fn get_facts_many(&self, requests: Vec<FactRequest>) -> Result<TaggedTupleStream> {
+        let mut found = Vec::new();
+        let mut below = Vec::new();
+        for (index, request) in requests.into_iter().enumerate() {
+            match self.in_memory(&request.predicate) {
+                Some(relations) => found.extend(
+                    answer(relations, &request)
+                        .into_iter()
+                        .map(|tuple| Ok((index, tuple))),
+                ),
+                None => below.push((index, request)),
+            }
+        }
+        if below.is_empty() {
+            return Ok(finished_stream(found));
+        }
+        let (indexes, requests): (Vec<usize>, Vec<FactRequest>) = below.into_iter().unzip();
+        let mut streamed = self.below.get_facts_many(requests).await?;
+        if found.is_empty() && indexes.iter().enumerate().all(|(at, index)| at == *index) {
+            return Ok(streamed);
+        }
+        // Some of the batch came from memory: the rest is renumbered as it streams.
+        let (tx, rx) = tokio::sync::mpsc::channel(found.len().max(64));
+        tokio::spawn(async move {
+            for item in found {
+                if tx.send(item).await.is_err() {
+                    return;
+                }
+            }
+            while let Some(item) = streamed.recv().await {
+                let item = item.map(|(at, tuple)| (indexes[at], tuple));
+                if tx.send(item).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(rx)
+    }
+}
+
 /// Evaluates the relations `wanted` need (every one the program defines, if `None`) over
 /// `store`, to a fixpoint.
 ///
@@ -672,22 +784,7 @@ pub fn evaluate<S: FactStore + ?Sized>(
         {
             continue;
         }
-        for predicate in &stratum {
-            derived.define(predicate);
-        }
-        for fact in program
-            .facts
-            .iter()
-            .filter(|f| stratum.contains(&f.predicate))
-        {
-            let tuple = fact
-                .args
-                .iter()
-                .filter_map(Term::const_value)
-                .cloned()
-                .collect();
-            derived.insert(&fact.predicate, tuple);
-        }
+        derived.start(program, &stratum);
         evaluate_stratum(program, store, &stratum, &mut derived)?;
     }
     Ok(derived)
@@ -699,13 +796,7 @@ fn evaluate_stratum<S: FactStore + ?Sized>(
     stratum: &[String],
     derived: &mut Derived,
 ) -> Result<()> {
-    let rules: Vec<&Rule> = program
-        .rules
-        .iter()
-        .filter(|rule| stratum.contains(&rule.head.predicate))
-        .collect();
-    let recursive = |atom: &Atom| stratum.contains(&atom.predicate);
-
+    let rules = stratum_rules(program, stratum);
     // The first round reads every relation whole.
     let mut added: Vec<(&str, Vec<FactTuple>)> = Vec::new();
     for rule in &rules {
@@ -715,36 +806,98 @@ fn evaluate_stratum<S: FactStore + ?Sized>(
         ));
     }
     let mut delta = commit(derived, added);
-
-    let any_recursive = rules
-        .iter()
-        .any(|rule| rule.positive_atoms().any(recursive));
-    while any_recursive && !delta.is_empty() {
+    while !delta.is_empty() {
         derived.delta = delta;
         let mut added = Vec::new();
-        for rule in &rules {
-            for (position, clause) in rule.body.iter().enumerate() {
-                let Clause::Atom(atom) = clause else {
-                    continue;
-                };
-                if !recursive(atom) {
-                    continue;
-                }
-                let mut body = rule.body.clone();
-                body[position] = Clause::Atom(Atom {
-                    predicate: delta_name(&atom.predicate),
-                    args: atom.args.clone(),
-                });
-                added.push((
-                    rule.head.predicate.as_str(),
-                    solve(rule, &body, store, derived)?,
-                ));
-            }
+        for (rule, body) in delta_bodies(&rules, stratum) {
+            added.push((
+                rule.head.predicate.as_str(),
+                solve(rule, &body, store, derived)?,
+            ));
         }
         delta = commit(derived, added);
     }
     derived.delta = Relations::default();
     Ok(())
+}
+
+/// [`evaluate`], over a [`Storage`]: the store's relations are asked for by what each
+/// rule's body binds, a batch at a time, and streamed; only what the program derives is
+/// held in memory.
+///
+/// # Errors
+/// As [`evaluate`], or if the storage fails.
+pub async fn evaluate_streaming<S: Storage + ?Sized>(
+    program: &Program,
+    storage: &S,
+    wanted: Option<&[&str]>,
+) -> Result<Derived> {
+    let strata = program.strata()?;
+    let needed = wanted.map(|wanted| program.needed(wanted.iter().copied()));
+    let mut derived = Derived::default();
+    for stratum in strata {
+        if needed
+            .as_ref()
+            .is_some_and(|needed| !stratum.iter().any(|p| needed.contains(p)))
+        {
+            continue;
+        }
+        derived.start(program, &stratum);
+        let rules = stratum_rules(program, &stratum);
+        let mut added = Vec::new();
+        for rule in &rules {
+            added.push((
+                rule.head.predicate.as_str(),
+                solve_streaming(rule, &rule.body, storage, &derived).await?,
+            ));
+        }
+        let mut delta = commit(&mut derived, added);
+        while !delta.is_empty() {
+            derived.delta = delta;
+            let mut added = Vec::new();
+            for (rule, body) in delta_bodies(&rules, &stratum) {
+                added.push((
+                    rule.head.predicate.as_str(),
+                    solve_streaming(rule, &body, storage, &derived).await?,
+                ));
+            }
+            delta = commit(&mut derived, added);
+        }
+        derived.delta = Relations::default();
+    }
+    Ok(derived)
+}
+
+/// The rules that define the relations of `stratum`.
+fn stratum_rules<'p>(program: &'p Program, stratum: &[String]) -> Vec<&'p Rule> {
+    program
+        .rules
+        .iter()
+        .filter(|rule| stratum.contains(&rule.head.predicate))
+        .collect()
+}
+
+/// Each rule of a recursive stratum once per recursive atom in its body, that atom reading
+/// the last round's tuples: a semi-naive round. Empty if no rule is recursive.
+fn delta_bodies<'p>(rules: &[&'p Rule], stratum: &[String]) -> Vec<(&'p Rule, Vec<Clause>)> {
+    let mut bodies = Vec::new();
+    for rule in rules {
+        for (position, clause) in rule.body.iter().enumerate() {
+            let Clause::Atom(atom) = clause else {
+                continue;
+            };
+            if !stratum.contains(&atom.predicate) {
+                continue;
+            }
+            let mut body = rule.body.clone();
+            body[position] = Clause::Atom(Atom {
+                predicate: delta_name(&atom.predicate),
+                args: atom.args.clone(),
+            });
+            bodies.push((*rule, body));
+        }
+    }
+    bodies
 }
 
 /// Adds tuples to what was derived; returns the ones that were new, under their delta names.
@@ -769,76 +922,132 @@ fn solve<S: FactStore + ?Sized>(
     derived: &Derived,
 ) -> Result<Vec<FactTuple>> {
     let layered = Layered::new(store, derived);
-    let query = match body {
-        [Clause::Atom(atom)] => Query::single(atom.clone()),
-        _ => Query::multi(body.to_vec())?,
-    };
     let client = DatafoxClient::new(DatafoxConfig::new(&layered).serial())?;
-    let solutions = client.eval(&query)?;
-    if !rule.head.is_aggregate() {
-        return Ok(solutions
-            .map(|solution| {
-                rule.head
-                    .args
-                    .iter()
-                    .map(|term| match term {
-                        HeadTerm::Term(Term::Var(variable)) => solution
-                            .lookup(variable)
-                            .cloned()
-                            .expect("a safe rule binds its head"),
-                        HeadTerm::Term(term) => {
-                            term.const_value().cloned().expect("checked in strata")
-                        }
-                        HeadTerm::Aggregate { .. } => unreachable!("not an aggregate"),
-                    })
-                    .collect()
-            })
-            .collect());
+    let mut heads = Heads::new(rule);
+    for solution in client.eval(&body_query(body)?)? {
+        heads.add(&solution);
+    }
+    heads.finish()
+}
+
+/// [`solve`], over a [`Storage`]: the body's solutions are streamed into the heads.
+async fn solve_streaming<S: Storage + ?Sized>(
+    rule: &Rule,
+    body: &[Clause],
+    storage: &S,
+    derived: &Derived,
+) -> Result<Vec<FactTuple>> {
+    let layered = LayeredStorage::new(storage, derived);
+    let client = DatafoxClient::new(DatafoxConfig::new(&layered).serial())?;
+    let mut heads = Heads::new(rule);
+    client
+        .stream(&body_query(body)?, &mut |solution| {
+            heads.add(&solution);
+            Ok(())
+        })
+        .await?;
+    heads.finish()
+}
+
+fn body_query(body: &[Clause]) -> Result<Query> {
+    match body {
+        [Clause::Atom(atom)] => Ok(Query::single(atom.clone())),
+        _ => Query::multi(body.to_vec()),
+    }
+}
+
+/// A rule's head tuples, from its body's solutions one at a time. An aggregating head
+/// groups the body's distinct solutions by the head's other terms; each aggregate gets its
+/// variable's value in every solution of the group.
+struct Heads<'r> {
+    rule: &'r Rule,
+    /// The variables of the body's positive atoms: what makes two solutions distinct.
+    variables: Vec<&'r str>,
+    tuples: Vec<FactTuple>,
+    distinct: HashSet<Vec<Value>>,
+    groups: BTreeMap<Vec<Value>, Vec<Vec<Value>>>,
+}
+
+impl<'r> Heads<'r> {
+    fn new(rule: &'r Rule) -> Self {
+        let variables: BTreeSet<&str> = rule.positive_atoms().flat_map(Atom::variables).collect();
+        Self {
+            rule,
+            variables: variables.into_iter().collect(),
+            tuples: Vec::new(),
+            distinct: HashSet::new(),
+            groups: BTreeMap::new(),
+        }
     }
 
-    // Group the body's distinct solutions by the head's other terms; each aggregate gets
-    // its variable's value in every solution of the group.
-    let variables: BTreeSet<&str> = rule.positive_atoms().flat_map(Atom::variables).collect();
-    let mut distinct: HashSet<Vec<Value>> = HashSet::new();
-    let mut groups: BTreeMap<Vec<Value>, Vec<Vec<Value>>> = BTreeMap::new();
-    for solution in solutions {
-        let bound = |variable: &str| solution.lookup(variable).cloned().expect("safe");
-        if !distinct.insert(variables.iter().map(|v| bound(v)).collect()) {
-            continue;
+    fn add(&mut self, solution: &Substitution) {
+        let bound = |variable: &str| {
+            solution
+                .lookup(variable)
+                .cloned()
+                .expect("a safe rule binds its head")
+        };
+        if !self.rule.head.is_aggregate() {
+            let tuple = self
+                .rule
+                .head
+                .args
+                .iter()
+                .map(|term| match term {
+                    HeadTerm::Term(Term::Var(variable)) => bound(variable),
+                    HeadTerm::Term(term) => term.const_value().cloned().expect("checked in strata"),
+                    HeadTerm::Aggregate { .. } => unreachable!("not an aggregate"),
+                })
+                .collect();
+            self.tuples.push(tuple);
+            return;
+        }
+        if !self
+            .distinct
+            .insert(self.variables.iter().map(|v| bound(v)).collect())
+        {
+            return;
         }
         let mut key = Vec::new();
         let mut values = Vec::new();
-        for term in &rule.head.args {
+        for term in &self.rule.head.args {
             match term {
                 HeadTerm::Term(Term::Var(variable)) => key.push(bound(variable)),
                 HeadTerm::Term(term) => key.push(term.const_value().cloned().expect("checked")),
                 HeadTerm::Aggregate { variable, .. } => values.push(bound(variable)),
             }
         }
-        let group = groups
+        let group = self
+            .groups
             .entry(key)
             .or_insert_with(|| vec![Vec::new(); values.len()]);
         for (slot, value) in group.iter_mut().zip(values) {
             slot.push(value);
         }
     }
-    let mut tuples = Vec::new();
-    for (key, group) in groups {
-        let mut key = key.into_iter();
-        let mut aggregates = group.into_iter();
-        let mut tuple = Vec::with_capacity(rule.head.args.len());
-        for term in &rule.head.args {
-            match term {
-                HeadTerm::Aggregate { aggregate, .. } => {
-                    let values = aggregates.next().expect("one per aggregate");
-                    tuple.push(fold(*aggregate, &rule.head.predicate, values)?);
-                }
-                HeadTerm::Term(_) => tuple.push(key.next().expect("one per term")),
-            }
+
+    fn finish(self) -> Result<Vec<FactTuple>> {
+        if !self.rule.head.is_aggregate() {
+            return Ok(self.tuples);
         }
-        tuples.push(tuple);
+        let mut tuples = Vec::new();
+        for (key, group) in self.groups {
+            let mut key = key.into_iter();
+            let mut aggregates = group.into_iter();
+            let mut tuple = Vec::with_capacity(self.rule.head.args.len());
+            for term in &self.rule.head.args {
+                match term {
+                    HeadTerm::Aggregate { aggregate, .. } => {
+                        let values = aggregates.next().expect("one per aggregate");
+                        tuple.push(fold(*aggregate, &self.rule.head.predicate, values)?);
+                    }
+                    HeadTerm::Term(_) => tuple.push(key.next().expect("one per term")),
+                }
+            }
+            tuples.push(tuple);
+        }
+        Ok(tuples)
     }
-    Ok(tuples)
 }
 
 /// An aggregate of a group's values, one per solution.
@@ -884,6 +1093,8 @@ mod tests {
     }
 
     /// The answers to the program's queries, over `store` and what it derives, as text.
+    /// The program's answers over `store`, which must be the same evaluated in memory and
+    /// streamed from a [`Storage`].
     fn answers(source: &str, store: &InMemoryStorage) -> Result<Vec<String>> {
         let program = parse_program(source)?;
         let derived = evaluate(&program, store, None)?;
@@ -894,6 +1105,27 @@ mod tests {
             for solution in client.eval(query)? {
                 found.push(show(&solution));
             }
+        }
+        found.sort();
+        let streamed = tokio::runtime::Runtime::new()
+            .expect("a runtime")
+            .block_on(streamed_answers(&program, store))?;
+        assert_eq!(streamed, found, "streamed from a Storage");
+        Ok(found)
+    }
+
+    async fn streamed_answers(program: &Program, store: &InMemoryStorage) -> Result<Vec<String>> {
+        let derived = evaluate_streaming(program, store, None).await?;
+        let layered = LayeredStorage::new(store, &derived);
+        let client = DatafoxClient::new(DatafoxConfig::new(&layered))?;
+        let mut found = Vec::new();
+        for query in &program.queries {
+            client
+                .stream(query, &mut |solution| {
+                    found.push(show(&solution));
+                    Ok(())
+                })
+                .await?;
         }
         found.sort();
         Ok(found)

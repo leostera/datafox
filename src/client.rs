@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
-use crate::evaluator::{Evaluator, eval_plan_streaming};
+use crate::evaluator::{Answer, Evaluator, eval_plan_streaming, stream_plan};
 use crate::{
     Error, Evaluation, EvaluationStrategy, FactStore, PREPARED_QUERY_FORMAT_VERSION, Plan, Planner,
     Prelude, PreparedQuery, Query, Result, Storage,
@@ -300,6 +300,20 @@ impl<'store, S: ?Sized> DatafoxClient<'store, S> {
         S: Storage,
     {
         self.eval_prepared_streaming(plan).await
+    }
+
+    /// Answers `query` over the storage, handing each answer to `answer` as it's found: what
+    /// the evaluation holds at once is bounded, not the answers' number or the relations'
+    /// sizes.
+    ///
+    /// # Errors
+    /// If the query can't be planned, the storage fails, or `answer` does.
+    pub async fn stream(&self, query: &Query, answer: &mut Answer<'_>) -> Result<()>
+    where
+        S: Storage,
+    {
+        let prepared = self.prepare(query)?;
+        stream_plan(self.storage, &self.environment.prelude, &prepared, answer).await
     }
 
     pub fn environment(&self) -> &DatafoxEnvironment {
