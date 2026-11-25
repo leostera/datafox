@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
 
@@ -113,33 +113,40 @@ impl BinaryOperator {
     }
 }
 
+/// The builtins and facts every query may use. A prelude is shared: cloning one is a
+/// count, and only a prelude being changed is copied. The default one is built once.
 #[derive(Clone)]
-pub struct Prelude {
+pub struct Prelude(Arc<Builtins>);
+
+#[derive(Clone)]
+struct Builtins {
     facts: InMemoryStorage,
     relations: BTreeMap<String, BinaryRelation>,
     operators: BTreeMap<String, BinaryOperator>,
 }
 
+/// The default prelude: building it costs more than many small evaluations.
+static DEFAULT: LazyLock<Prelude> = LazyLock::new(|| {
+    Prelude::empty()
+        .with_relations(default_relations())
+        .with_operators(default_operators())
+});
+
 impl Prelude {
     pub fn new() -> Self {
-        let mut prelude = Self::empty();
-
-        for relation in default_relations() {
-            prelude = prelude.with_relation(relation);
-        }
-        for operator in default_operators() {
-            prelude = prelude.with_operator(operator);
-        }
-
-        prelude
+        DEFAULT.clone()
     }
 
     pub fn empty() -> Self {
-        Self {
+        Self(Arc::new(Builtins {
             facts: InMemoryStorage::new(),
             relations: BTreeMap::new(),
             operators: BTreeMap::new(),
-        }
+        }))
+    }
+
+    fn builtins(&mut self) -> &mut Builtins {
+        Arc::make_mut(&mut self.0)
     }
 
     pub fn with_fact(
@@ -147,21 +154,26 @@ impl Prelude {
         predicate: impl Into<String>,
         tuple: impl IntoIterator<Item = Value>,
     ) -> Self {
-        self.facts.insert(predicate, tuple.into_iter().collect());
+        self.builtins()
+            .facts
+            .insert(predicate, tuple.into_iter().collect());
         self
     }
 
     pub fn with_facts(mut self, facts: impl IntoIterator<Item = (String, Vec<FactTuple>)>) -> Self {
+        let builtins = self.builtins();
         for (predicate, tuples) in facts {
             for tuple in tuples {
-                self.facts.insert(predicate.clone(), tuple);
+                builtins.facts.insert(predicate.clone(), tuple);
             }
         }
         self
     }
 
     pub fn with_relation(mut self, relation: BinaryRelation) -> Self {
-        self.relations.insert(relation.name().to_string(), relation);
+        self.builtins()
+            .relations
+            .insert(relation.name().to_string(), relation);
         self
     }
 
@@ -173,7 +185,9 @@ impl Prelude {
     }
 
     pub fn with_operator(mut self, operator: BinaryOperator) -> Self {
-        self.operators.insert(operator.name().to_string(), operator);
+        self.builtins()
+            .operators
+            .insert(operator.name().to_string(), operator);
         self
     }
 
@@ -185,15 +199,15 @@ impl Prelude {
     }
 
     pub(crate) fn facts(&self) -> &InMemoryStorage {
-        &self.facts
+        &self.0.facts
     }
 
     pub(crate) fn relation(&self, name: &str) -> Option<&BinaryRelation> {
-        self.relations.get(name)
+        self.0.relations.get(name)
     }
 
     pub(crate) fn operator(&self, name: &str) -> Option<&BinaryOperator> {
-        self.operators.get(name)
+        self.0.operators.get(name)
     }
 }
 

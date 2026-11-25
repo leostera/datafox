@@ -331,7 +331,14 @@ impl<'a, S: FactStore + ?Sized> Planner<'a, S> {
                 .enumerate()
                 .filter(|(_, clause)| clause.requires.is_subset(&bound))
                 .min_by_key(|(_, clause)| {
-                    clause.order_key(context, self.storage, self.estimator, self.prelude, &bound)
+                    let rows = clause.estimated_rows(
+                        context,
+                        self.storage,
+                        self.estimator,
+                        self.prelude,
+                        &bound,
+                    );
+                    clause.order_key(&bound, rows)
                 })
             else {
                 return Err(blocked_clause_error(&clauses[0], context));
@@ -416,22 +423,23 @@ struct CandidateClause {
 }
 
 impl CandidateClause {
+    /// Which ready clause goes first: a builtin (which only keeps or drops what's bound
+    /// so far, and costs nothing to ask), then a connected atom binding more of its
+    /// variables, with fewer `rows`, written first.
     fn order_key(
         &self,
-        context: &PlanContext,
-        storage: Option<&(impl FactStore + ?Sized)>,
-        estimator: Option<&Estimator<'_>>,
-        prelude: &Prelude,
         bound: &BTreeSet<VariableId>,
-    ) -> (bool, Reverse<usize>, usize, usize) {
+        rows: usize,
+    ) -> (bool, bool, Reverse<usize>, usize, usize) {
         let bound_variable_count = self.bound_variable_count(bound);
         let variables = self.variables();
         let disconnected = !bound.is_empty() && !variables.is_empty() && bound_variable_count == 0;
 
         (
+            !matches!(self.clause, PreparedClause::Relation(_)),
             disconnected,
             Reverse(bound_variable_count),
-            self.estimated_rows(context, storage, estimator, prelude, bound),
+            rows,
             self.original_index,
         )
     }
@@ -721,6 +729,35 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(predicates, vec!["root", "child", "small"]);
+        Ok(())
+    }
+
+    #[test]
+    fn planner_runs_a_builtin_as_soon_as_its_variables_are_bound() -> Result<()> {
+        let pair = |a: i64, b: i64| vec![Value::integer(a), Value::integer(b)];
+        let storage = InMemoryStorage::from_facts([
+            ("import".to_string(), (0..200).map(|i| pair(i, i)).collect()),
+            (
+                "resolved".to_string(),
+                (0..300).map(|i| pair(i, i)).collect(),
+            ),
+        ]);
+        let prelude = Prelude::new();
+        let query = parse_query("import(F, N), resolved(F, S), N > 190")?;
+
+        let plan = Planner::new(&storage, &prelude).plan(&query)?;
+
+        let order = plan
+            .clauses
+            .iter()
+            .map(|clause| match clause {
+                PreparedClause::Atom(atom) => plan.predicate_name(atom.predicate),
+                PreparedClause::Relation(relation) => relation.name.as_str(),
+                PreparedClause::Negated(_) => "!",
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(order, vec!["import", ">", "resolved"]);
         Ok(())
     }
 
