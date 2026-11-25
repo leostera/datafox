@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::evaluator::{Answer, Evaluator, eval_plan_streaming, stream_plan};
 use crate::{
-    Error, Evaluation, EvaluationStrategy, FactStore, PREPARED_QUERY_FORMAT_VERSION, Plan, Planner,
-    Prelude, PreparedQuery, Query, Result, Storage,
+    Error, Evaluation, EvaluationStrategy, FactStore, InMemoryStorage,
+    PREPARED_QUERY_FORMAT_VERSION, Plan, Planner, Prelude, PreparedQuery, Query, Result, Storage,
+    Value,
 };
 
 #[derive(Clone, Default)]
@@ -312,7 +313,14 @@ impl<'store, S: ?Sized> DatafoxClient<'store, S> {
     where
         S: Storage,
     {
-        let prepared = self.prepare(query)?;
+        let estimator = |predicate: &str, pattern: &[Option<Value>]| {
+            self.storage
+                .estimate_matches(predicate, pattern)
+                .map_or(0, |estimate| estimate.rows)
+        };
+        let prepared = Planner::<InMemoryStorage>::for_prelude(&self.environment.prelude)
+            .with_estimator(&estimator)
+            .plan(query)?;
         stream_plan(self.storage, &self.environment.prelude, &prepared, answer).await
     }
 

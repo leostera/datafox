@@ -154,6 +154,16 @@ pub trait Storage: Send + Sync {
     /// The tuples each of `requests` asks for, each with its request's index, in any order.
     /// An evaluation asks for a batch of lookups at once; a store that can answer them in
     /// one job (one query, one round trip) overrides this, which asks one at a time.
+    /// How many rows a pattern of `predicate` may match, if the store can tell cheaply:
+    /// queries are planned with it, so the most selective clause goes first.
+    fn estimate_matches(
+        &self,
+        _predicate: &str,
+        _pattern: &[Option<Value>],
+    ) -> Option<FactEstimate> {
+        None
+    }
+
     async fn get_facts_many(&self, requests: Vec<FactRequest>) -> Result<TaggedTupleStream> {
         let mut found = Vec::new();
         for (index, request) in requests.into_iter().enumerate() {
@@ -177,6 +187,10 @@ where
 
     async fn get_facts_many(&self, requests: Vec<FactRequest>) -> Result<TaggedTupleStream> {
         (**self).get_facts_many(requests).await
+    }
+
+    fn estimate_matches(&self, predicate: &str, pattern: &[Option<Value>]) -> Option<FactEstimate> {
+        (**self).estimate_matches(predicate, pattern)
     }
 }
 
@@ -414,6 +428,10 @@ fn best_index<'a>(
 
 #[async_trait]
 impl Storage for InMemoryStorage {
+    fn estimate_matches(&self, predicate: &str, pattern: &[Option<Value>]) -> Option<FactEstimate> {
+        Some(FactStore::estimate(self, predicate, pattern))
+    }
+
     async fn get_facts(&self, request: FactRequest) -> Result<TupleStream> {
         let pattern = request.pattern_options();
         let limit = match request.mode {

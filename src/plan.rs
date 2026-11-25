@@ -173,15 +173,28 @@ impl ExecutablePlan<'_> {
 
 pub struct Planner<'a, S: FactStore + ?Sized = crate::InMemoryStorage> {
     storage: Option<&'a S>,
+    /// How many rows a pattern may match, for a store that isn't a [`FactStore`].
+    estimator: Option<&'a Estimator<'a>>,
     prelude: &'a Prelude,
 }
+
+/// How many rows of `predicate` may match a pattern.
+pub type Estimator<'a> = dyn Fn(&str, &[Option<Value>]) -> usize + 'a;
 
 impl<'a, S: FactStore + ?Sized> Planner<'a, S> {
     pub fn new(storage: &'a S, prelude: &'a Prelude) -> Self {
         Self {
             storage: Some(storage),
+            estimator: None,
             prelude,
         }
+    }
+
+    /// Orders clauses by `estimator`'s estimates too.
+    #[must_use]
+    pub fn with_estimator(mut self, estimator: &'a Estimator<'a>) -> Self {
+        self.estimator = Some(estimator);
+        self
     }
 
     pub fn plan(&self, query: &Query) -> Result<PreparedQuery> {
@@ -318,7 +331,7 @@ impl<'a, S: FactStore + ?Sized> Planner<'a, S> {
                 .enumerate()
                 .filter(|(_, clause)| clause.requires.is_subset(&bound))
                 .min_by_key(|(_, clause)| {
-                    clause.order_key(context, self.storage, self.prelude, &bound)
+                    clause.order_key(context, self.storage, self.estimator, self.prelude, &bound)
                 })
             else {
                 return Err(blocked_clause_error(&clauses[0], context));
@@ -337,6 +350,7 @@ impl<'a> Planner<'a, crate::InMemoryStorage> {
     pub fn for_prelude(prelude: &'a Prelude) -> Self {
         Self {
             storage: None,
+            estimator: None,
             prelude,
         }
     }
@@ -406,6 +420,7 @@ impl CandidateClause {
         &self,
         context: &PlanContext,
         storage: Option<&(impl FactStore + ?Sized)>,
+        estimator: Option<&Estimator<'_>>,
         prelude: &Prelude,
         bound: &BTreeSet<VariableId>,
     ) -> (bool, Reverse<usize>, usize, usize) {
@@ -416,7 +431,7 @@ impl CandidateClause {
         (
             disconnected,
             Reverse(bound_variable_count),
-            self.estimated_rows(context, storage, prelude, bound),
+            self.estimated_rows(context, storage, estimator, prelude, bound),
             self.original_index,
         )
     }
@@ -443,6 +458,7 @@ impl CandidateClause {
         &self,
         context: &PlanContext,
         storage: Option<&(impl FactStore + ?Sized)>,
+        estimator: Option<&Estimator<'_>>,
         prelude: &Prelude,
         bound: &BTreeSet<VariableId>,
     ) -> usize {
@@ -451,6 +467,7 @@ impl CandidateClause {
                 let predicate = context.predicate_name(atom.predicate);
                 let pattern = atom.estimate_pattern(context, bound);
                 storage.map_or(0, |storage| storage.estimate(predicate, &pattern).rows)
+                    + estimator.map_or(0, |estimate| estimate(predicate, &pattern))
                     + prelude.facts().estimate(predicate, &pattern).rows
             }
             PreparedClause::Relation(_) => 0,

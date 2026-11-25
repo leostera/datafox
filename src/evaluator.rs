@@ -1074,8 +1074,8 @@ mod pipeline_tests {
 
     use super::BATCH;
     use crate::{
-        DatafoxClient, DatafoxConfig, FactRequest, Result, Storage, TaggedTupleStream, TupleStream,
-        Value, finished_stream, parse_query,
+        DatafoxClient, DatafoxConfig, FactEstimate, FactRequest, Result, Storage,
+        TaggedTupleStream, TupleStream, Value, finished_stream, parse_query,
     };
 
     /// `big(N)` for N in 0..BIG, produced lazily; `small(N, N)` for even N. Records what
@@ -1090,10 +1090,28 @@ mod pipeline_tests {
 
     #[async_trait]
     impl Storage for Recording {
+        fn estimate_matches(
+            &self,
+            predicate: &str,
+            pattern: &[Option<Value>],
+        ) -> Option<FactEstimate> {
+            let bound = pattern.iter().any(Option::is_some);
+            Some(match (predicate, bound) {
+                ("big", _) => FactEstimate::exact(BIG as usize),
+                (_, true) => FactEstimate::upper_bound(1),
+                // `small` answers only lookups: a scan would be the most expensive.
+                (_, false) => FactEstimate::upper_bound(BIG as usize * 2),
+            })
+        }
+
         async fn get_facts(&self, request: FactRequest) -> Result<TupleStream> {
             let pattern = request.pattern_options();
             match request.predicate.as_str() {
                 "big" => {
+                    if let [Some(Value::Integer(n))] = &pattern[..] {
+                        let found = (0..BIG).contains(n).then(|| Ok(vec![Value::integer(*n)]));
+                        return Ok(finished_stream(found.into_iter().collect()));
+                    }
                     let (tx, rx) = mpsc::channel(16);
                     let events = Arc::clone(&self.events);
                     tokio::spawn(async move {
@@ -1108,9 +1126,16 @@ mod pipeline_tests {
                 }
                 _ => {
                     self.events.lock().unwrap().push("small asked".to_owned());
-                    let tuples = match &pattern[..] {
-                        [Some(Value::Integer(n)), None] if n % 2 == 0 => {
-                            vec![Ok(vec![Value::integer(*n), Value::integer(*n)])]
+                    let n = match &pattern[..] {
+                        [Some(Value::Integer(n)), None] | [None, Some(Value::Integer(n))] => {
+                            Some(*n)
+                        }
+                        [Some(Value::Integer(a)), Some(Value::Integer(b))] if a == b => Some(*a),
+                        _ => None,
+                    };
+                    let tuples = match n {
+                        Some(n) if n % 2 == 0 => {
+                            vec![Ok(vec![Value::integer(n), Value::integer(n)])]
                         }
                         _ => Vec::new(),
                     };
@@ -1166,6 +1191,27 @@ mod pipeline_tests {
         assert!(
             first_small < big_done,
             "`small` was asked for while `big` still streamed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_clause_the_storage_estimates_smallest_goes_first() -> Result<()> {
+        let storage = Recording::default();
+        let client = DatafoxClient::new(DatafoxConfig::new(&storage))?;
+        let mut found = Vec::new();
+        client
+            .stream(&parse_query("big(X), small(X, 4)")?, &mut |answer| {
+                found.push(answer.lookup("X").cloned());
+                Ok(())
+            })
+            .await?;
+        assert_eq!(found, [Some(Value::integer(4))]);
+        let events = storage.events.lock().unwrap().clone();
+        assert_eq!(events.first().map(String::as_str), Some("small asked"));
+        assert!(
+            !events.iter().any(|e| e == "big done"),
+            "`big` wasn't scanned"
         );
         Ok(())
     }

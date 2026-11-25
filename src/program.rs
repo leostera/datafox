@@ -715,6 +715,13 @@ fn answer(relations: &Relations, request: &FactRequest) -> Vec<FactTuple> {
 
 #[async_trait]
 impl<S: Storage + ?Sized> Storage for LayeredStorage<'_, S> {
+    fn estimate_matches(&self, predicate: &str, pattern: &[Option<Value>]) -> Option<FactEstimate> {
+        match self.in_memory(predicate) {
+            Some(relations) => Some(relations.estimate(predicate, pattern)),
+            None => self.below.estimate_matches(predicate, pattern),
+        }
+    }
+
     async fn get_facts(&self, request: FactRequest) -> Result<TupleStream> {
         match self.in_memory(&request.predicate) {
             Some(relations) => Ok(finished_stream(
