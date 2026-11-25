@@ -816,7 +816,11 @@ fn evaluate_stratum<S: FactStore + ?Sized>(
     while !delta.is_empty() {
         derived.delta = delta;
         let mut added = Vec::new();
-        for (rule, body) in delta_bodies(&rules, stratum) {
+        let layered = Layered::new(store, derived);
+        let bodies = delta_bodies(&rules, stratum, &|delta, atom| {
+            smaller(&layered, delta, atom)
+        });
+        for (rule, body) in bodies {
             added.push((
                 rule.head.predicate.as_str(),
                 solve(rule, &body, store, derived)?,
@@ -862,7 +866,8 @@ pub async fn evaluate_streaming<S: Storage + ?Sized>(
         while !delta.is_empty() {
             derived.delta = delta;
             let mut added = Vec::new();
-            for (rule, body) in delta_bodies(&rules, &stratum) {
+            // The planner orders the streamed bodies by the storage's estimates.
+            for (rule, body) in delta_bodies(&rules, &stratum, &|_, _| false) {
                 added.push((
                     rule.head.predicate.as_str(),
                     solve_streaming(rule, &body, storage, &derived).await?,
@@ -886,7 +891,15 @@ fn stratum_rules<'p>(program: &'p Program, stratum: &[String]) -> Vec<&'p Rule> 
 
 /// Each rule of a recursive stratum once per recursive atom in its body, that atom reading
 /// the last round's tuples: a semi-naive round. Empty if no rule is recursive.
-fn delta_bodies<'p>(rules: &[&'p Rule], stratum: &[String]) -> Vec<(&'p Rule, Vec<Clause>)> {
+///
+/// An atom `first` says the last round added fewer tuples to than the body's first atom
+/// matches goes first: the round starts from what's new, rather than finding it in
+/// everything else.
+fn delta_bodies<'p>(
+    rules: &[&'p Rule],
+    stratum: &[String],
+    first: &dyn Fn(&str, &Atom) -> bool,
+) -> Vec<(&'p Rule, Vec<Clause>)> {
     let mut bodies = Vec::new();
     for rule in rules {
         for (position, clause) in rule.body.iter().enumerate() {
@@ -896,15 +909,38 @@ fn delta_bodies<'p>(rules: &[&'p Rule], stratum: &[String]) -> Vec<(&'p Rule, Ve
             if !stratum.contains(&atom.predicate) {
                 continue;
             }
-            let mut body = rule.body.clone();
-            body[position] = Clause::Atom(Atom {
+            let delta = Clause::Atom(Atom {
                 predicate: delta_name(&atom.predicate),
                 args: atom.args.clone(),
             });
+            let mut body = rule.body.clone();
+            let written_first = rule.body[..position]
+                .iter()
+                .find_map(|clause| match clause {
+                    Clause::Atom(atom) => Some(atom),
+                    _ => None,
+                });
+            if written_first.is_some_and(|written| first(&delta_name(&atom.predicate), written)) {
+                body.remove(position);
+                body.insert(0, delta);
+            } else {
+                body[position] = delta;
+            }
             bodies.push((*rule, body));
         }
     }
     bodies
+}
+
+/// Whether the last round added fewer tuples to `delta` than `atom` matches in `store`.
+fn smaller<S: FactStore + ?Sized>(store: &Layered<'_, S>, delta: &str, atom: &Atom) -> bool {
+    let pattern: Vec<Option<Value>> = atom
+        .args
+        .iter()
+        .map(|term| term.const_value().cloned())
+        .collect();
+    let new = store.estimate(delta, &vec![None; atom.args.len()]).rows;
+    new < store.estimate(&atom.predicate, &pattern).rows
 }
 
 /// Adds tuples to what was derived; returns the ones that were new, under their delta names.
@@ -1090,6 +1126,23 @@ fn fold(aggregate: Aggregate, predicate: &str, values: Vec<Value>) -> Result<Val
 mod tests {
     use super::*;
     use crate::{InMemoryStorage, Substitution, parse_program};
+
+    #[test]
+    fn a_rounds_new_tuples_go_first_when_theyre_fewer_than_what_the_body_starts_with() -> Result<()>
+    {
+        let program = parse_program("reaches(A, C) :- edge(A, B), reaches(B, C).")?;
+        let rules: Vec<&Rule> = program.rules.iter().collect();
+        let stratum = ["reaches".to_owned()];
+        let first = |body: &[Clause]| match &body[0] {
+            Clause::Atom(atom) => atom.predicate.clone(),
+            _ => String::new(),
+        };
+        let fewer = delta_bodies(&rules, &stratum, &|_, _| true);
+        assert_eq!(first(&fewer[0].1), delta_name("reaches"));
+        let more = delta_bodies(&rules, &stratum, &|_, _| false);
+        assert_eq!(first(&more[0].1), "edge");
+        Ok(())
+    }
 
     fn store() -> InMemoryStorage {
         let edge = |a: i64, b: i64| vec![Value::integer(a), Value::integer(b)];
