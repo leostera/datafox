@@ -1,17 +1,20 @@
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
-use std::sync::Arc;
+use rustc_hash::FxHashMap;
+use std::collections::hash_map::Entry;
+use std::sync::{Arc, Mutex};
 use std::vec::IntoIter;
 #[cfg(test)]
 use tokio::sync::mpsc;
 #[cfg(test)]
 use tracing::debug;
 
+use crate::lookups::{Answering, Lookups};
 use crate::plan::{
     ExecutablePlan, PlannedAtom, PlannedClause, PlannedRelation, PlannedTerm, VariableId,
 };
 use crate::{
-    AtomRole, Error, FactRequest, FactRequestMode, FactStore, OperatorOutcome, Plan, Prelude,
-    Result, Storage, Substitution, Value,
+    AtomRole, Error, FactRequest, FactRequestMode, FactStore, FactTuple, OperatorOutcome, Plan,
+    Prelude, Result, Storage, Substitution, Value,
 };
 
 #[cfg(test)]
@@ -648,6 +651,7 @@ where
         storage,
         prelude,
         plan: &executable,
+        lookups: Mutex::default(),
     };
     let root = vec![PlanSeed::new(executable.variable_count())];
     pipeline.run(0, root, answer).await
@@ -658,6 +662,23 @@ struct Pipeline<'a, S: Storage + ?Sized> {
     storage: &'a S,
     prelude: &'a Prelude,
     plan: &'a ExecutablePlan<'a>,
+    /// What the store answered: never locked across an await.
+    lookups: Mutex<Lookups>,
+}
+
+/// A batch's lookups of one clause that weren't kept: each distinct pattern once, and which
+/// of the batch's seeds asked it.
+#[derive(Default)]
+struct Asked {
+    patterns: Vec<Vec<Option<Value>>>,
+    seeds: Vec<Vec<usize>>,
+}
+
+/// A batch's lookups of one clause: each seed's kept answer, by its index in the batch, and
+/// what is to be asked.
+struct BatchLookups {
+    kept: Vec<(usize, Arc<[FactTuple]>)>,
+    asked: Asked,
 }
 
 type Step<'b> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'b>>;
@@ -695,7 +716,7 @@ impl<'a, S: Storage + ?Sized> Pipeline<'a, S> {
                     }
                 }
                 PlannedClause::Negated(atom) => {
-                    let found = self.matched(atom, &seeds).await?;
+                    let found = self.matched(clause, atom, &seeds).await?;
                     let kept: Vec<PlanSeed> = seeds
                         .into_iter()
                         .zip(found)
@@ -706,19 +727,41 @@ impl<'a, S: Storage + ?Sized> Pipeline<'a, S> {
                     }
                 }
                 PlannedClause::Atom(atom) => {
-                    let requests = self.requests(atom, &seeds, AtomRole::Positive)?;
-                    let mut tuples = self.storage.get_facts_many(requests).await?;
+                    let BatchLookups { kept, asked } = self.lookups(clause, atom, &seeds)?;
                     let mut matched = Vec::new();
-                    while let Some(found) = tuples.recv().await {
-                        let (index, tuple) = found?;
-                        if let Some(seed) =
-                            match_planned_atom(&seeds[index], atom, &tuple, self.plan)?
-                        {
-                            matched.push(seed);
-                            if matched.len() == BATCH {
-                                self.run(next, std::mem::take(&mut matched), answer).await?;
+                    for (index, tuples) in kept {
+                        for tuple in tuples.iter() {
+                            if let Some(seed) =
+                                match_planned_atom(&seeds[index], atom, tuple, self.plan)?
+                            {
+                                matched.push(seed);
+                                if matched.len() == BATCH {
+                                    self.run(next, std::mem::take(&mut matched), answer).await?;
+                                }
                             }
                         }
+                    }
+                    if !asked.patterns.is_empty() {
+                        let requests = self.requests(atom, &asked.patterns, AtomRole::Positive);
+                        let mut answering: Vec<Answering> =
+                            asked.patterns.iter().map(|_| Answering::new()).collect();
+                        let mut tuples = self.storage.get_facts_many(requests).await?;
+                        while let Some(found) = tuples.recv().await {
+                            let (request, tuple) = found?;
+                            answering[request].push(&tuple);
+                            for &index in &asked.seeds[request] {
+                                if let Some(seed) =
+                                    match_planned_atom(&seeds[index], atom, &tuple, self.plan)?
+                                {
+                                    matched.push(seed);
+                                    if matched.len() == BATCH {
+                                        self.run(next, std::mem::take(&mut matched), answer)
+                                            .await?;
+                                    }
+                                }
+                            }
+                        }
+                        self.keep(clause, asked.patterns, answering);
                     }
                     for seed in &seeds {
                         for tuple in self.prelude_facts(atom, seed)? {
@@ -736,16 +779,39 @@ impl<'a, S: Storage + ?Sized> Pipeline<'a, S> {
         })
     }
 
-    /// Whether each of `seeds` matches `atom`: what a negated atom asks.
-    async fn matched(&self, atom: &PlannedAtom, seeds: &[PlanSeed]) -> Result<Vec<bool>> {
+    /// Whether each of `seeds` matches `atom`, the clause at `clause`: what a negated atom
+    /// asks.
+    async fn matched(
+        &self,
+        clause: usize,
+        atom: &PlannedAtom,
+        seeds: &[PlanSeed],
+    ) -> Result<Vec<bool>> {
         let mut found = vec![false; seeds.len()];
-        let requests = self.requests(atom, seeds, AtomRole::Negated)?;
-        let mut tuples = self.storage.get_facts_many(requests).await?;
-        while let Some(tuple) = tuples.recv().await {
-            let (index, tuple) = tuple?;
-            if match_planned_atom(&seeds[index], atom, &tuple, self.plan)?.is_some() {
-                found[index] = true;
+        let BatchLookups { kept, asked } = self.lookups(clause, atom, seeds)?;
+        for (index, tuples) in kept {
+            for tuple in tuples.iter() {
+                if match_planned_atom(&seeds[index], atom, tuple, self.plan)?.is_some() {
+                    found[index] = true;
+                    break;
+                }
             }
+        }
+        if !asked.patterns.is_empty() {
+            let requests = self.requests(atom, &asked.patterns, AtomRole::Negated);
+            let mut answering: Vec<Answering> =
+                asked.patterns.iter().map(|_| Answering::new()).collect();
+            let mut tuples = self.storage.get_facts_many(requests).await?;
+            while let Some(tuple) = tuples.recv().await {
+                let (request, tuple) = tuple?;
+                answering[request].push(&tuple);
+                for &index in &asked.seeds[request] {
+                    if match_planned_atom(&seeds[index], atom, &tuple, self.plan)?.is_some() {
+                        found[index] = true;
+                    }
+                }
+            }
+            self.keep(clause, asked.patterns, answering);
         }
         for (index, seed) in seeds.iter().enumerate() {
             if found[index] {
@@ -761,26 +827,71 @@ impl<'a, S: Storage + ?Sized> Pipeline<'a, S> {
         Ok(found)
     }
 
-    /// One request per seed: `atom`'s tuples with what the seed binds.
+    /// Each of `seeds`' lookup of `atom`, the clause at `clause`: answered from what was
+    /// kept, or to be asked, once for all the seeds that bind the same values.
+    fn lookups(
+        &self,
+        clause: usize,
+        atom: &PlannedAtom,
+        seeds: &[PlanSeed],
+    ) -> Result<BatchLookups> {
+        let lookups = self
+            .lookups
+            .lock()
+            .expect("lookups are never locked across a panic");
+        let mut kept = Vec::new();
+        let mut asked = Asked::default();
+        let mut by_pattern: FxHashMap<Vec<Option<Value>>, usize> = FxHashMap::default();
+        for (index, seed) in seeds.iter().enumerate() {
+            let pattern = planned_atom_to_pattern(atom, seed, self.plan)?;
+            if let Some(tuples) = lookups.get(clause, &pattern) {
+                kept.push((index, tuples));
+                continue;
+            }
+            match by_pattern.entry(pattern) {
+                Entry::Occupied(request) => asked.seeds[*request.get()].push(index),
+                Entry::Vacant(request) => {
+                    asked.patterns.push(request.key().clone());
+                    asked.seeds.push(vec![index]);
+                    request.insert(asked.seeds.len() - 1);
+                }
+            }
+        }
+        Ok(BatchLookups { kept, asked })
+    }
+
+    /// Keeps what each of `patterns`, the clause at `clause`'s, was answered, if it's small.
+    fn keep(&self, clause: usize, patterns: Vec<Vec<Option<Value>>>, answers: Vec<Answering>) {
+        let mut lookups = self
+            .lookups
+            .lock()
+            .expect("lookups are never locked across a panic");
+        for (pattern, answer) in patterns.into_iter().zip(answers) {
+            if let Some(tuples) = answer.finish() {
+                lookups.keep(clause, pattern, tuples);
+            }
+        }
+    }
+
+    /// One request per pattern: `atom`'s tuples matching it.
     fn requests(
         &self,
         atom: &PlannedAtom,
-        seeds: &[PlanSeed],
+        patterns: &[Vec<Option<Value>>],
         role: AtomRole,
-    ) -> Result<Vec<FactRequest>> {
+    ) -> Vec<FactRequest> {
         let predicate = self.plan.predicate_name(atom.predicate);
         let groups = planned_atom_equality_groups(atom);
-        seeds
+        patterns
             .iter()
-            .map(|seed| {
-                let pattern = planned_atom_to_pattern(atom, seed, self.plan)?;
-                Ok(FactRequest::matching(predicate, pattern)
+            .map(|pattern| {
+                FactRequest::matching(predicate, pattern.clone())
                     .with_role(role)
                     .with_equality_groups(groups.clone())
                     .with_mode(match role {
                         AtomRole::Positive => FactRequestMode::Tuples,
                         AtomRole::Negated => FactRequestMode::Exists,
-                    }))
+                    })
             })
             .collect()
     }
@@ -1078,8 +1189,9 @@ mod pipeline_tests {
         TaggedTupleStream, TupleStream, Value, finished_stream, parse_query,
     };
 
-    /// `big(N)` for N in 0..BIG, produced lazily; `small(N, N)` for even N. Records what
-    /// it was asked for, and when `big` was done.
+    /// `big(N)` for N in 0..BIG, produced lazily; `small(N, N)` for even N;
+    /// `tens(N, N % 10)`, only looked up. Records what it was asked for, and when `big` was
+    /// done.
     #[derive(Default, Clone)]
     struct Recording {
         events: Arc<Mutex<Vec<String>>>,
@@ -1123,6 +1235,16 @@ mod pipeline_tests {
                         events.lock().unwrap().push("big done".to_owned());
                     });
                     Ok(rx)
+                }
+                "tens" => {
+                    self.events.lock().unwrap().push("tens asked".to_owned());
+                    let found = match &pattern[..] {
+                        [Some(Value::Integer(n)), _] if (0..BIG).contains(n) => {
+                            vec![Ok(vec![Value::integer(*n), Value::integer(n % 10)])]
+                        }
+                        _ => Vec::new(),
+                    };
+                    Ok(finished_stream(found))
                 }
                 _ => {
                     self.events.lock().unwrap().push("small asked".to_owned());
@@ -1213,6 +1335,41 @@ mod pipeline_tests {
             !events.iter().any(|e| e == "big done"),
             "`big` wasn't scanned"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_lookup_is_asked_of_the_store_once() -> Result<()> {
+        let storage = Recording::default();
+        let client = DatafoxClient::new(DatafoxConfig::new(&storage))?;
+        let (mut answers, mut missing) = (0, 0);
+        client
+            .stream(
+                &parse_query("big(X), tens(X, T), small(T, Y), !small(X, Y)")?,
+                &mut |_| {
+                    answers += 1;
+                    Ok(())
+                },
+            )
+            .await?;
+        client
+            .stream(
+                &parse_query("big(X), tens(X, T), !small(T, T)")?,
+                &mut |_| {
+                    missing += 1;
+                    Ok(())
+                },
+            )
+            .await?;
+        // `small(T, Y)` for the even T, but not `small(X, Y)` for the X in 0..10.
+        assert_eq!(answers, 500 - 5);
+        assert_eq!(missing, 500);
+        let events = storage.events.lock().unwrap().clone();
+        let asked = |what: &str| events.iter().filter(|e| *e == what).count();
+        // Each query asks `tens` once per X; `small(T, ..)`, positive or negated, once
+        // per T; `!small(X, Y)` once per X with an even T.
+        assert_eq!(asked("tens asked"), 2 * BIG as usize);
+        assert_eq!(asked("small asked"), 10 + 500 + 10);
         Ok(())
     }
 

@@ -44,6 +44,7 @@ mod client;
 mod diagnostic;
 pub mod error;
 mod evaluator;
+mod lookups;
 mod parser;
 mod plan;
 mod prelude;

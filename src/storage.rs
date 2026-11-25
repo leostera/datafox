@@ -151,9 +151,6 @@ pub trait Storage: Send + Sync {
             .await
     }
 
-    /// The tuples each of `requests` asks for, each with its request's index, in any order.
-    /// An evaluation asks for a batch of lookups at once; a store that can answer them in
-    /// one job (one query, one round trip) overrides this, which asks one at a time.
     /// How many rows a pattern of `predicate` may match, if the store can tell cheaply:
     /// queries are planned with it, so the most selective clause goes first.
     fn estimate_matches(
@@ -164,6 +161,11 @@ pub trait Storage: Send + Sync {
         None
     }
 
+    /// The tuples each of `requests` asks for, each with its request's index, in any order.
+    /// An evaluation asks for a batch of lookups at once; a store that can answer them in
+    /// one job (one query, one round trip) overrides this, which asks one at a time. A store
+    /// doesn't change while an evaluation reads it: a lookup it asked again is answered
+    /// from what the store answered the first time.
     async fn get_facts_many(&self, requests: Vec<FactRequest>) -> Result<TaggedTupleStream> {
         let mut found = Vec::new();
         for (index, request) in requests.into_iter().enumerate() {
