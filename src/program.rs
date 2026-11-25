@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use async_trait::async_trait;
 
 use crate::{
-    Atom, Clause, DatafoxClient, DatafoxConfig, Error, FactEstimate, FactRequest, FactRequestMode,
-    FactStore, FactTuple, Query, Result, Storage, Substitution, TaggedTupleStream, Term,
-    TupleStream, Value, finished_stream, matches_pattern,
+    Atom, Clause, DatafoxClient, DatafoxConfig, DatafoxEnvironment, Error, FactEstimate,
+    FactRequest, FactRequestMode, FactStore, FactTuple, Query, Result, Storage, Substitution,
+    TaggedTupleStream, Term, TupleStream, Value, finished_stream, matches_pattern,
 };
 
 /// A program: facts, rules, and the queries to answer over them.
@@ -781,6 +781,21 @@ pub fn evaluate<S: FactStore + ?Sized>(
     store: &S,
     wanted: Option<&[&str]>,
 ) -> Result<Derived> {
+    evaluate_in(&DatafoxEnvironment::new(), program, store, wanted)
+}
+
+/// [`evaluate`], with `environment`'s prelude and its prepared queries: a planning cache
+/// kept across evaluations plans each rule's body once, however many stores it's
+/// evaluated over.
+///
+/// # Errors
+/// As [`evaluate`].
+pub fn evaluate_in<S: FactStore + ?Sized>(
+    environment: &DatafoxEnvironment,
+    program: &Program,
+    store: &S,
+    wanted: Option<&[&str]>,
+) -> Result<Derived> {
     let strata = program.strata()?;
     let needed = wanted.map(|wanted| program.needed(wanted.iter().copied()));
     let mut derived = Derived::default();
@@ -792,12 +807,13 @@ pub fn evaluate<S: FactStore + ?Sized>(
             continue;
         }
         derived.start(program, &stratum);
-        evaluate_stratum(program, store, &stratum, &mut derived)?;
+        evaluate_stratum(environment, program, store, &stratum, &mut derived)?;
     }
     Ok(derived)
 }
 
 fn evaluate_stratum<S: FactStore + ?Sized>(
+    environment: &DatafoxEnvironment,
     program: &Program,
     store: &S,
     stratum: &[String],
@@ -809,7 +825,7 @@ fn evaluate_stratum<S: FactStore + ?Sized>(
     for rule in &rules {
         added.push((
             rule.head.predicate.as_str(),
-            solve(rule, &rule.body, store, derived)?,
+            solve(environment, rule, &rule.body, store, derived)?,
         ));
     }
     let mut delta = commit(derived, added);
@@ -823,7 +839,7 @@ fn evaluate_stratum<S: FactStore + ?Sized>(
         for (rule, body) in bodies {
             added.push((
                 rule.head.predicate.as_str(),
-                solve(rule, &body, store, derived)?,
+                solve(environment, rule, &body, store, derived)?,
             ));
         }
         delta = commit(derived, added);
@@ -959,13 +975,15 @@ fn commit(derived: &mut Derived, added: Vec<(&str, Vec<FactTuple>)>) -> Relation
 
 /// The head tuples `body` gives `rule`, aggregated if its head aggregates.
 fn solve<S: FactStore + ?Sized>(
+    environment: &DatafoxEnvironment,
     rule: &Rule,
     body: &[Clause],
     store: &S,
     derived: &Derived,
 ) -> Result<Vec<FactTuple>> {
     let layered = Layered::new(store, derived);
-    let client = DatafoxClient::new(DatafoxConfig::new(&layered).serial())?;
+    let config = DatafoxConfig::new(&layered).with_environment(environment.clone());
+    let client = DatafoxClient::new(config.serial())?;
     let mut heads = Heads::new(rule);
     for solution in client.eval(&body_query(body)?)? {
         heads.add(&solution);
@@ -1141,6 +1159,32 @@ mod tests {
         assert_eq!(first(&fewer[0].1), delta_name("reaches"));
         let more = delta_bodies(&rules, &stratum, &|_, _| false);
         assert_eq!(first(&more[0].1), "edge");
+        Ok(())
+    }
+
+    #[test]
+    fn a_planning_cache_plans_a_program_once_over_every_store() -> Result<()> {
+        let program = parse_program(
+            "reaches(A, B) :- edge(A, B).\nreaches(A, C) :- edge(A, B), reaches(B, C).",
+        )?;
+        let cache = crate::PlanningCache::unbounded();
+        let environment = DatafoxEnvironment::builder()
+            .with_planning_cache(cache.clone())
+            .build();
+        let first = evaluate_in(&environment, &program, &store(), None)?;
+        let planned = cache.len()?;
+        assert!(planned > 0);
+        let other = InMemoryStorage::from_facts([(
+            "edge".to_owned(),
+            vec![vec![Value::integer(7), Value::integer(8)]],
+        )]);
+        let second = evaluate_in(&environment, &program, &other, None)?;
+        assert_eq!(cache.len()?, planned, "nothing planned again");
+        assert_eq!(
+            first.len("reaches"),
+            evaluate(&program, &store(), None)?.len("reaches")
+        );
+        assert_eq!(second.len("reaches"), 1);
         Ok(())
     }
 

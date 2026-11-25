@@ -71,7 +71,7 @@ pub use prelude::{BinaryOperator, BinaryRelation, OperatorOutcome, Prelude, Rela
 pub use pretty::{format_queries, format_query};
 pub use program::{
     Aggregate, Derived, Head, HeadTerm, Layered, LayeredScan, LayeredStorage, Program, Rule,
-    evaluate, evaluate_streaming,
+    evaluate, evaluate_in, evaluate_streaming,
 };
 pub use storage::{
     AtomRole, FactEstimate, FactRequest, FactRequestHints, FactRequestMode, FactScan, FactStore,

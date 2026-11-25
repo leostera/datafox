@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -115,9 +115,10 @@ pub trait PreparedQueryStorage: Send + Sync {
     fn insert(&self, key: PreparedQueryKey, prepared: Arc<PreparedQuery>) -> Result<()>;
 }
 
+/// Prepared queries in memory, shared: read at once by every evaluation using them.
 #[derive(Clone, Default)]
 pub struct InMemoryPreparedQueryStorage {
-    inner: Arc<Mutex<BTreeMap<PreparedQueryKey, Arc<PreparedQuery>>>>,
+    inner: Arc<RwLock<BTreeMap<PreparedQueryKey, Arc<PreparedQuery>>>>,
 }
 
 pub type PlanningCache = InMemoryPreparedQueryStorage;
@@ -128,31 +129,37 @@ impl InMemoryPreparedQueryStorage {
     }
 
     pub fn len(&self) -> Result<usize> {
-        Ok(self.lock()?.len())
+        Ok(self.read()?.len())
     }
 
     pub fn is_empty(&self) -> Result<bool> {
-        Ok(self.lock()?.is_empty())
+        Ok(self.read()?.is_empty())
     }
 
-    fn lock(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, BTreeMap<PreparedQueryKey, Arc<PreparedQuery>>>> {
-        self.inner
-            .lock()
-            .map_err(|error| Error::PreparedQueryStorage {
-                message: format!("prepared query storage lock poisoned: {error}"),
-            })
+    fn read(&self) -> Result<RwLockReadGuard<'_, PreparedQueries>> {
+        self.inner.read().map_err(poisoned)
+    }
+
+    fn write(&self) -> Result<RwLockWriteGuard<'_, PreparedQueries>> {
+        self.inner.write().map_err(poisoned)
+    }
+}
+
+type PreparedQueries = BTreeMap<PreparedQueryKey, Arc<PreparedQuery>>;
+
+fn poisoned(error: impl std::fmt::Display) -> Error {
+    Error::PreparedQueryStorage {
+        message: format!("prepared query storage lock poisoned: {error}"),
     }
 }
 
 impl PreparedQueryStorage for InMemoryPreparedQueryStorage {
     fn get(&self, key: &PreparedQueryKey) -> Result<Option<Arc<PreparedQuery>>> {
-        Ok(self.lock()?.get(key).cloned())
+        Ok(self.read()?.get(key).cloned())
     }
 
     fn insert(&self, key: PreparedQueryKey, prepared: Arc<PreparedQuery>) -> Result<()> {
-        self.lock()?.entry(key).or_insert(prepared);
+        self.write()?.entry(key).or_insert(prepared);
         Ok(())
     }
 }
